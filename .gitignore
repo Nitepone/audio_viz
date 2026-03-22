@@ -1,0 +1,22 @@
+# ── Cargo build output ────────────────────────────────────────────────────────
+/target/
+
+# ── Cargo lock (keep for binaries, ignore for libraries)
+# This is a binary crate, so Cargo.lock is committed to ensure reproducible
+# builds.  Remove the line below if you want to ignore it.
+# Cargo.lock
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── Rust-specific ─────────────────────────────────────────────────────────────
+# Backup files created by rustfmt
+**/*.rs.bk
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
