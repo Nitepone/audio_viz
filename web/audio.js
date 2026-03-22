@@ -6,10 +6,15 @@
  *   - Runs an AnalyserNode for FFT magnitude data
  *   - Keeps a rolling buffer of raw PCM samples for left/right channels
  *   - Exposes getFrame() → { fft, left, right } each animation frame
+ *
+ * The AudioContext sample rate is intentionally left at the browser default
+ * so it matches the rate the microphone stream is actually captured at.
+ * Forcing a specific rate causes a cross-context mismatch warning in Firefox
+ * and silently produces corrupted audio on some hardware.  The actual rate is
+ * readable via the sampleRate getter and should be passed to the WASM tick().
  */
 
-const FFT_SIZE    = 4096;
-const SAMPLE_RATE = 44100;
+const FFT_SIZE = 4096;
 
 export class AudioCapture {
   constructor() {
@@ -30,33 +35,33 @@ export class AudioCapture {
   async start() {
     if (this._started) return;
 
+    // Do not request a specific sampleRate — let the browser and hardware
+    // negotiate.  Firefox rejects cross-rate AudioContext connections.
     this._stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation:   false,
-        noiseSuppression:   false,
-        autoGainControl:    false,
-        sampleRate:         SAMPLE_RATE,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl:  false,
       },
       video: false,
     });
 
-    this._ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    // No sampleRate constraint: the context adopts the hardware's native rate.
+    this._ctx = new AudioContext();
 
     const source = this._ctx.createMediaStreamSource(this._stream);
 
     // ── Analyser for FFT magnitude ──────────────────────────────────────────
     this._analyser = this._ctx.createAnalyser();
-    this._analyser.fftSize            = FFT_SIZE;
-    this._analyser.smoothingTimeConstant = 0.0; // no smoothing — visualizers do their own
+    this._analyser.fftSize               = FFT_SIZE;
+    this._analyser.smoothingTimeConstant = 0.0; // visualizers do their own smoothing
     this._fftBuf   = new Float32Array(this._analyser.frequencyBinCount);
 
     // ── ScriptProcessor for raw PCM ────────────────────────────────────────
     // ScriptProcessorNode is deprecated but remains the only cross-browser
     // way to extract per-channel PCM without an AudioWorklet build step.
-    // bufferSize=4096 matches FFT_SIZE so we get a full window each callback.
-    const bufSize       = FFT_SIZE;
     const channelCount  = Math.min(source.channelCount, 2);
-    this._processor     = this._ctx.createScriptProcessor(bufSize, channelCount, channelCount);
+    this._processor     = this._ctx.createScriptProcessor(FFT_SIZE, channelCount, channelCount);
 
     const leftBuf  = this._left;
     const rightBuf = this._right;
@@ -73,7 +78,7 @@ export class AudioCapture {
 
     source.connect(this._analyser);
     source.connect(this._processor);
-    // Processor must be connected to destination to fire callbacks
+    // Processor must be connected to destination to fire its callback
     this._processor.connect(this._ctx.destination);
 
     this._started = true;
@@ -93,6 +98,12 @@ export class AudioCapture {
   get isRunning() { return this._started; }
 
   /**
+   * The actual sample rate negotiated with the hardware.
+   * Only valid after start() has resolved.
+   */
+  get sampleRate() { return this._ctx?.sampleRate ?? 44100; }
+
+  /**
    * Snapshot the current audio state.
    * Returns { fft: Float32Array, left: Float32Array, right: Float32Array }
    * where fft contains linear magnitude values (not dBFS).
@@ -106,8 +117,8 @@ export class AudioCapture {
       };
     }
 
-    // AnalyserNode gives us dBFS; convert to linear magnitude to match
-    // what the Rust visualizers expect from rustfft output.
+    // AnalyserNode gives dBFS; convert to linear magnitude to match what
+    // rustfft produces.
     this._analyser.getFloatFrequencyData(this._fftBuf);
     const fft = new Float32Array(this._fftBuf.length);
     for (let i = 0; i < this._fftBuf.length; i++) {
@@ -115,10 +126,6 @@ export class AudioCapture {
       fft[i] = Math.min(1.0, Math.pow(10, this._fftBuf[i] / 20));
     }
 
-    return {
-      fft,
-      left:  this._left,
-      right: this._right,
-    };
+    return { fft, left: this._left, right: this._right };
   }
 }
