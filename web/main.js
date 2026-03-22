@@ -80,7 +80,7 @@ function loop(ts) {
 
   // Get audio data and tick the visualizer
   const { fft, left, right } = audio.getFrame();
-  viz.tick(fft, left, right, dt);
+  viz.tick(fft, left, right, dt, audio.sampleRate);
 
   // Render and paint
   const cellsJson = viz.render(fpsSmooth);
