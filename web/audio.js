@@ -37,16 +37,15 @@ export class AudioCapture {
 
     this._stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation:     false,
-        noiseSuppression:     false,
-        autoGainControl:      false,
-        // iOS Safari applies its voice-processing pipeline regardless of the
-        // constraints above when using the default microphone category.
-        // Setting the sample rate hint nudges WebKit into selecting the
-        // measurement/recording session category instead of voice chat,
-        // which bypasses Apple's DSP stack.
-        // The actual negotiated rate may differ; we read it back via sampleRate.
-        sampleRate:           { ideal: 44100 },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl:  false,
+        // Requesting stereo forces iOS Safari into a non-voice AVAudioSession
+        // category, which enables the mic mode picker in Control Center
+        // (including the "Wide Spectrum" option).  On devices with only a
+        // mono microphone the browser falls back to mono gracefully.
+        channelCount:     { ideal: 2 },
+        sampleRate:       { ideal: 44100 },
       },
       video: false,
     });
@@ -125,7 +124,7 @@ export class AudioCapture {
       };
     }
 
-    // AnalyserNode returns dBFS; convert to linear to match rustfft output
+    // AnalyserNode returns dBFS; convert to linear magnitude to match rustfft output.
     this._analyser.getFloatFrequencyData(this._fftBuf);
     const fft = new Float32Array(this._fftBuf.length);
     for (let i = 0; i < this._fftBuf.length; i++) {
