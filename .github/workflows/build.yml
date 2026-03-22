@@ -251,8 +251,13 @@ jobs:
           files: release_assets/*
 
   # ── Web / GitHub Pages ────────────────────────────────────────────────────
+  # Runs on main, tags, and dev/* branches.
+  # The deploy jobs below decide where to push the result.
   web:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    if: |
+      github.ref == 'refs/heads/main'       ||
+      startsWith(github.ref, 'refs/tags/')  ||
+      startsWith(github.ref, 'refs/heads/dev/')
     runs-on: ubuntu-latest
 
     steps:
@@ -295,7 +300,7 @@ jobs:
         with:
           path: site
 
-  # ── Deploy to GitHub Pages (main branch only) ─────────────────────────────
+  # ── Deploy to GitHub Pages — main ─────────────────────────────────────────
   deploy-pages:
     needs: web
     if: github.ref == 'refs/heads/main'
@@ -305,6 +310,25 @@ jobs:
       id-token: write
     environment:
       name: github-pages
+      url:  ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+  # ── Deploy to GitHub Pages — dev/* ────────────────────────────────────────
+  # Every push to any dev/* branch overwrites the same preview environment,
+  # giving a single stable URL to check the current state of development.
+  deploy-pages-dev:
+    needs: web
+    if: startsWith(github.ref, 'refs/heads/dev/')
+    runs-on: ubuntu-latest
+    permissions:
+      pages:    write
+      id-token: write
+    environment:
+      name: github-pages-dev
       url:  ${{ steps.deploy.outputs.page_url }}
 
     steps:
