@@ -12,7 +12,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use audio_viz::visualizer::{AudioFrame, TermSize, Visualizer, FFT_SIZE, SAMPLE_RATE};
+use audio_viz::visualizer::{AudioFrame, TermSize, Visualizer, FFT_SIZE};
 use audio_viz::visualizers;
 
 // ── xterm-256 → RGB lookup ────────────────────────────────────────────────────
@@ -185,15 +185,17 @@ impl WebViz {
 
     /// Advance the visualizer by one frame.
     ///
-    /// `fft_ptr` and `fft_len` point to the magnitude spectrum (FFT_SIZE/2+1 floats).
-    /// `left_ptr`/`right_ptr` point to FFT_SIZE raw audio samples each.
-    /// `dt` is elapsed seconds since the last tick.
+    /// `fft`   — magnitude spectrum (FFT_SIZE/2+1 floats, linear scale).
+    /// `left`  / `right` — FFT_SIZE raw audio samples per channel.
+    /// `dt`    — elapsed seconds since the last tick.
+    /// `sample_rate` — the actual rate negotiated with the hardware.
     pub fn tick(
         &mut self,
-        fft:   &[f32],
-        left:  &[f32],
-        right: &[f32],
-        dt:    f32,
+        fft:         &[f32],
+        left:        &[f32],
+        right:       &[f32],
+        dt:          f32,
+        sample_rate: u32,
     ) {
         // Pad or truncate to FFT_SIZE
         let mut l = left.to_vec();
@@ -208,7 +210,7 @@ impl WebViz {
             right:       r,
             mono:        m,
             fft:         fft.to_vec(),
-            sample_rate: SAMPLE_RATE,
+            sample_rate,
         };
         self.viz.tick(&frame, dt, self.size);
     }
