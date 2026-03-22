@@ -1,85 +1,93 @@
 /**
  * audio.js — Microphone capture via the Web Audio API.
  *
- * Provides an AudioCapture class that:
- *   - Requests microphone permission
- *   - Runs an AnalyserNode for FFT magnitude data
- *   - Keeps a rolling buffer of raw PCM samples for left/right channels
- *   - Exposes getFrame() → { fft, left, right } each animation frame
+ * Uses AudioWorklet (processor.worklet.js) for PCM capture, which is
+ * correctly supported on iOS Safari 15+.  ScriptProcessorNode was
+ * previously used but is unreliable on iOS — it silently delivers
+ * zero-filled buffers and its callback often never fires.
  *
- * The AudioContext sample rate is intentionally left at the browser default
- * so it matches the rate the microphone stream is actually captured at.
- * Forcing a specific rate causes a cross-context mismatch warning in Firefox
- * and silently produces corrupted audio on some hardware.  The actual rate is
- * readable via the sampleRate getter and should be passed to the WASM tick().
+ * The AudioContext sample rate is left at the browser/hardware default.
+ * Forcing 44100 causes a cross-context mismatch warning in Firefox and
+ * breaks audio capture on iOS entirely.  The actual rate is exposed via
+ * the sampleRate getter and passed to the WASM tick() call so the
+ * visualizers can compute correct FFT bin frequencies.
  */
 
 const FFT_SIZE = 4096;
 
 export class AudioCapture {
   constructor() {
-    this._ctx       = null;
-    this._analyser  = null;
-    this._fftBuf    = null;
-    this._left      = new Float32Array(FFT_SIZE);
-    this._right     = new Float32Array(FFT_SIZE);
-    this._processor = null;
-    this._stream    = null;
-    this._started   = false;
+    this._ctx      = null;
+    this._analyser = null;
+    this._fftBuf   = null;
+    this._left     = new Float32Array(FFT_SIZE);
+    this._right    = new Float32Array(FFT_SIZE);
+    this._stream   = null;
+    this._worklet  = null;
+    this._started  = false;
   }
 
   /**
    * Request microphone access and start the audio graph.
-   * Returns a Promise that resolves when audio is flowing.
+   * Must be called from a user gesture (click/tap).
+   * Returns a Promise that resolves once audio is flowing.
    */
   async start() {
     if (this._started) return;
 
-    // Do not request a specific sampleRate — let the browser and hardware
-    // negotiate.  Firefox rejects cross-rate AudioContext connections.
     this._stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl:  false,
+        echoCancellation:     false,
+        noiseSuppression:     false,
+        autoGainControl:      false,
+        // iOS Safari applies its voice-processing pipeline regardless of the
+        // constraints above when using the default microphone category.
+        // Setting the sample rate hint nudges WebKit into selecting the
+        // measurement/recording session category instead of voice chat,
+        // which bypasses Apple's DSP stack.
+        // The actual negotiated rate may differ; we read it back via sampleRate.
+        sampleRate:           { ideal: 44100 },
       },
       video: false,
     });
 
-    // No sampleRate constraint: the context adopts the hardware's native rate.
+    // Do not force a sample rate — let the browser match the hardware.
+    // iOS Safari suspends the context immediately even inside a gesture
+    // handler, so we explicitly resume() after creation.
     this._ctx = new AudioContext();
+    await this._ctx.resume();
 
     const source = this._ctx.createMediaStreamSource(this._stream);
 
-    // ── Analyser for FFT magnitude ──────────────────────────────────────────
+    // ── Analyser for FFT magnitude ────────────────────────────────────────
     this._analyser = this._ctx.createAnalyser();
     this._analyser.fftSize               = FFT_SIZE;
-    this._analyser.smoothingTimeConstant = 0.0; // visualizers do their own smoothing
+    this._analyser.smoothingTimeConstant = 0.0;
     this._fftBuf   = new Float32Array(this._analyser.frequencyBinCount);
+    source.connect(this._analyser);
 
-    // ── ScriptProcessor for raw PCM ────────────────────────────────────────
-    // ScriptProcessorNode is deprecated but remains the only cross-browser
-    // way to extract per-channel PCM without an AudioWorklet build step.
-    const channelCount  = Math.min(source.channelCount, 2);
-    this._processor     = this._ctx.createScriptProcessor(FFT_SIZE, channelCount, channelCount);
+    // ── AudioWorklet for raw PCM ──────────────────────────────────────────
+    // The worklet file must be served from the same origin as the page.
+    await this._ctx.audioWorklet.addModule('./processor.worklet.js');
 
+    this._worklet = new AudioWorkletNode(this._ctx, 'capture-processor', {
+      // Request up to 2 input channels; the worklet handles mono gracefully
+      channelCount:          2,
+      channelCountMode:      'explicit',
+      channelInterpretation: 'discrete',
+    });
+
+    // The worklet posts complete FFT_SIZE windows back to the main thread
     const leftBuf  = this._left;
     const rightBuf = this._right;
-
-    this._processor.onaudioprocess = (ev) => {
-      const L = ev.inputBuffer.getChannelData(0);
-      leftBuf.set(L);
-      // If mono input, mirror left → right
-      const R = ev.inputBuffer.numberOfChannels > 1
-        ? ev.inputBuffer.getChannelData(1)
-        : L;
-      rightBuf.set(R);
+    this._worklet.port.onmessage = (ev) => {
+      leftBuf.set(ev.data.left);
+      rightBuf.set(ev.data.right);
     };
 
-    source.connect(this._analyser);
-    source.connect(this._processor);
-    // Processor must be connected to destination to fire its callback
-    this._processor.connect(this._ctx.destination);
+    source.connect(this._worklet);
+    // Worklet must be connected to destination to keep the audio graph alive
+    this._worklet.connect(this._ctx.destination);
 
     this._started = true;
   }
@@ -87,7 +95,7 @@ export class AudioCapture {
   /** Stop the audio graph and release the microphone. */
   stop() {
     if (!this._started) return;
-    this._processor?.disconnect();
+    this._worklet?.disconnect();
     this._analyser?.disconnect();
     this._stream?.getTracks().forEach(t => t.stop());
     this._ctx?.close();
@@ -117,12 +125,10 @@ export class AudioCapture {
       };
     }
 
-    // AnalyserNode gives dBFS; convert to linear magnitude to match what
-    // rustfft produces.
+    // AnalyserNode returns dBFS; convert to linear to match rustfft output
     this._analyser.getFloatFrequencyData(this._fftBuf);
     const fft = new Float32Array(this._fftBuf.length);
     for (let i = 0; i < this._fftBuf.length; i++) {
-      // dBFS → linear: 10^(dBFS/20), clamped to [0, 1]
       fft[i] = Math.min(1.0, Math.pow(10, this._fftBuf[i] / 20));
     }
 

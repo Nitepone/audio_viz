@@ -251,8 +251,13 @@ jobs:
           files: release_assets/*
 
   # ── Web / GitHub Pages ────────────────────────────────────────────────────
+  # Runs on main, tags, and dev/* branches.
+  # The deploy jobs below decide where to push the result.
   web:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    if: |
+      github.ref == 'refs/heads/main'       ||
+      startsWith(github.ref, 'refs/tags/')  ||
+      startsWith(github.ref, 'refs/heads/dev/')
     runs-on: ubuntu-latest
 
     steps:
@@ -284,11 +289,12 @@ jobs:
       - name: Assemble site
         run: |
           mkdir site
-          cp web/index.html  site/
-          cp web/main.js     site/
-          cp web/audio.js    site/
-          cp web/renderer.js site/
-          cp -r web/pkg      site/pkg
+          cp web/index.html           site/
+          cp web/main.js              site/
+          cp web/audio.js             site/
+          cp web/renderer.js          site/
+          cp web/processor.worklet.js site/
+          cp -r web/pkg               site/pkg
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
