@@ -19,6 +19,10 @@ jobs:
               sudo apt-get update && sudo apt-get install -y libasound2-dev
               cargo build --target x86_64-unknown-linux-gnu
 
+          - name: windows
+            os:   windows-latest
+            run:  cargo build --target x86_64-pc-windows-msvc
+
           - name: wasm
             os:   ubuntu-latest
             run: |
@@ -35,7 +39,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu,wasm32-unknown-unknown
+          targets: x86_64-unknown-linux-gnu,wasm32-unknown-unknown,x86_64-pc-windows-msvc
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -76,6 +80,12 @@ jobs:
             make_deb:        false
             make_appimage:   false
 
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_bin:    audio_viz-windows-x86_64
+            make_deb:        false
+            make_appimage:   false
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -110,7 +120,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_bin }}
-          path: target/${{ matrix.target }}/release/audio_viz
+          path: |
+            target/${{ matrix.target }}/release/audio_viz
+            target/${{ matrix.target }}/release/audio_viz.exe
           if-no-files-found: error
 
       # ── Debian package (Linux only) ─────────────────────────────────────────
@@ -230,10 +242,11 @@ jobs:
         run: |
           mkdir release_assets
 
-          cp dist/audio_viz-linux-x86_64/audio_viz    release_assets/audio_viz-linux-x86_64
-          cp dist/audio_viz-macos-x86_64/audio_viz    release_assets/audio_viz-macos-x86_64
-          cp dist/audio_viz-macos-aarch64/audio_viz   release_assets/audio_viz-macos-aarch64
-          cp dist/audio_viz-linux-x86_64-deb/*.deb    release_assets/
+          cp dist/audio_viz-linux-x86_64/audio_viz         release_assets/audio_viz-linux-x86_64
+          cp dist/audio_viz-macos-x86_64/audio_viz         release_assets/audio_viz-macos-x86_64
+          cp dist/audio_viz-macos-aarch64/audio_viz        release_assets/audio_viz-macos-aarch64
+          cp dist/audio_viz-windows-x86_64/audio_viz.exe   release_assets/audio_viz-windows-x86_64.exe
+          cp dist/audio_viz-linux-x86_64-deb/*.deb         release_assets/
           cp dist/audio_viz-linux-x86_64-appimage/*.AppImage release_assets/
 
           git archive --format=tar.gz \
@@ -301,7 +314,7 @@ jobs:
         with:
           path: site
 
-  # ── Deploy to GitHub Pages (main branch only) ─────────────────────────────
+  # ── Deploy to GitHub Pages — main ─────────────────────────────────────────
   deploy-pages:
     needs: web
     if: github.ref == 'refs/heads/main'

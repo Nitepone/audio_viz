@@ -22,10 +22,9 @@ required-features = ["terminal"]
 # The "terminal" feature pulls in every dependency that doesn't compile on
 # wasm32.  It is enabled by default so that `cargo build` (no flags) still
 # produces the full terminal binary.  The WASM crate depends on this crate
-# without activating it, which keeps crossterm/cpal/clap/libc out of the
-# WASM build.
+# without activating it, which keeps crossterm/cpal/clap out of the WASM build.
 default  = ["terminal"]
-terminal = ["dep:crossterm", "dep:cpal", "dep:clap", "dep:anyhow", "dep:libc"]
+terminal = ["dep:crossterm", "dep:cpal", "dep:clap", "dep:anyhow"]
 
 [dependencies]
 rustfft    = "6"
@@ -34,11 +33,16 @@ serde_json = "1"
 
 # Terminal-only dependencies, excluded from the WASM build
 anyhow    = { version = "1.0.102", optional = true }
-cpal      = { version = "0.15", default-features = false, optional = true }
 crossterm = { version = "0.28", optional = true }
 clap      = { version = "4", features = ["derive"], optional = true }
 
-libc = { version = "0.2", optional = true }
+# cpal: WASAPI on Windows and ALSA/CoreAudio on Linux/macOS are selected
+# automatically by cpal based on the target — no feature flags needed.
+cpal = { version = "0.15", default-features = false, optional = true }
+
+# libc is only used by the Linux stderr silencer
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 # build.rs only uses std — no extra deps needed
