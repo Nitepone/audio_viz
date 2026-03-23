@@ -4,8 +4,6 @@ A multi-mode terminal audio visualizer written in Rust. Captures system audio
 and renders real-time ASCII visualizations in your terminal using 256-colour
 ANSI escape codes.
 
-**Try the Web Version:** [https://nitepone.github.io/audio_viz/](https://nitepone.github.io/audio_viz/)
-
 <p align="center">
   <img src="img/img1.png" width="49%" alt="Lissajous XY scope with beat-driven rotation, planets, and spectrum shell" />
   <img src="img/img2.png" width="49%" alt="Dual-channel oscilloscope showing left and right waveforms" />
@@ -32,7 +30,23 @@ sudo apt install libasound2-plugins pulseaudio-utils
 
 ### macOS
 - [BlackHole](https://existential.audio/blackhole/) — virtual loopback driver for system audio capture
-- Set BlackHole as your audio output (or create a Multi-Output Device in Audio MIDI Setup to hear audio simultaneously)
+
+```bash
+brew install --cask blackhole-2ch
+```
+
+After installing, set BlackHole 2ch as your audio output in System Settings → Sound, or create a Multi-Output Device in Audio MIDI Setup to hear audio simultaneously while capturing it.
+
+### Windows
+`cpal` on Windows captures from input devices only and cannot read directly from a playback device. [VB-Cable](https://vb-audio.com/Cable/) provides a virtual loopback device. It is not available via winget and must be installed manually:
+
+1. Download VB-Cable from [vb-audio.com/Cable](https://vb-audio.com/Cable/) and run the installer as Administrator
+2. Reboot
+3. Set **CABLE Input** as your default playback device in Sound Settings
+4. Run `audio_viz --list-devices` to find the CABLE Output index
+5. Run `audio_viz --device "CABLE Output"`
+
+To hear audio while visualizing, open the CABLE Output properties in Sound Settings, go to the Listen tab, and enable "Listen to this device".
 
 ---
 
