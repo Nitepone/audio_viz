@@ -1,16 +1,23 @@
 /**
- * audio.js — Microphone capture via the Web Audio API.
+ * audio.js — Microphone and optional system audio capture via the Web Audio API.
+ *
+ * Two capture modes are supported:
+ *
+ *   Microphone  — getUserMedia(), works on all browsers and platforms.
+ *
+ *   System audio — getDisplayMedia() with audio:true.  The user shares a
+ *     browser tab and checks "Share tab audio" in the picker.  Supported on
+ *     Chrome and Edge (desktop only).  Firefox and Safari silently omit the
+ *     audio track; mobile browsers do not support it at all.
  *
  * Uses AudioWorklet (processor.worklet.js) for PCM capture, which is
  * correctly supported on iOS Safari 15+.  ScriptProcessorNode was
- * previously used but is unreliable on iOS — it silently delivers
- * zero-filled buffers and its callback often never fires.
+ * previously used but is unreliable on iOS.
  *
  * The AudioContext sample rate is left at the browser/hardware default.
  * Forcing 44100 causes a cross-context mismatch warning in Firefox and
- * breaks audio capture on iOS entirely.  The actual rate is exposed via
- * the sampleRate getter and passed to the WASM tick() call so the
- * visualizers can compute correct FFT bin frequencies.
+ * breaks audio capture on iOS.  The actual rate is exposed via the
+ * sampleRate getter and passed to the WASM tick() call.
  */
 
 const FFT_SIZE = 4096;
@@ -28,31 +35,74 @@ export class AudioCapture {
   }
 
   /**
-   * Request microphone access and start the audio graph.
-   * Must be called from a user gesture (click/tap).
-   * Returns a Promise that resolves once audio is flowing.
+   * Returns true if getDisplayMedia system audio is likely supported.
+   * Used to decide whether to show the system audio button.
    */
-  async start() {
-    if (this._started) return;
+  static systemAudioSupported() {
+    return (
+      typeof navigator.mediaDevices?.getDisplayMedia === 'function' &&
+      // Firefox and Safari implement getDisplayMedia but drop the audio track;
+      // only offer it on Chromium-based browsers where it actually works.
+      /Chrome|Chromium|Edg/.test(navigator.userAgent) &&
+      !/Mobile|Android|iPhone|iPad/.test(navigator.userAgent)
+    );
+  }
 
+  /**
+   * Start microphone capture.
+   * Must be called from a user gesture (click/tap).
+   */
+  async startMic() {
+    if (this._started) return;
     this._stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: false,
         noiseSuppression: false,
         autoGainControl:  false,
-        // Requesting stereo forces iOS Safari into a non-voice AVAudioSession
-        // category, which enables the mic mode picker in Control Center
-        // (including the "Wide Spectrum" option).  On devices with only a
-        // mono microphone the browser falls back to mono gracefully.
+        // Requesting stereo nudges iOS into a non-voice AVAudioSession category,
+        // making the mic mode picker (Wide Spectrum etc.) available in Control Center.
         channelCount:     { ideal: 2 },
         sampleRate:       { ideal: 44100 },
       },
       video: false,
     });
+    await this._initGraph();
+  }
 
-    // Do not force a sample rate — let the browser match the hardware.
-    // iOS Safari suspends the context immediately even inside a gesture
-    // handler, so we explicitly resume() after creation.
+  /**
+   * Start system audio capture via getDisplayMedia.
+   * Prompts the user to share a tab; they must check "Share tab audio".
+   * Resolves even if no audio track is present — call hasAudio() to check.
+   */
+  async startSystem() {
+    if (this._started) return;
+    const display = await navigator.mediaDevices.getDisplayMedia({
+      video: true,   // required by the API even though we don't use the video
+      audio: {
+        systemAudio:              'include',
+        suppressLocalAudioPlayback: false,
+      },
+    });
+
+    // Extract only the audio tracks; discard video to avoid rendering overhead
+    const audioTracks = display.getAudioTracks();
+    if (audioTracks.length === 0) {
+      display.getTracks().forEach(t => t.stop());
+      throw new Error(
+        'No audio track in the shared stream.\n' +
+        'Make sure to check "Share tab audio" in the sharing dialog.'
+      );
+    }
+
+    this._stream = new MediaStream(audioTracks);
+    // Stop the video tracks we don't need
+    display.getVideoTracks().forEach(t => t.stop());
+
+    await this._initGraph();
+  }
+
+  /** Shared graph initialisation used by both capture modes. */
+  async _initGraph() {
     this._ctx = new AudioContext();
     await this._ctx.resume();
 
@@ -66,17 +116,14 @@ export class AudioCapture {
     source.connect(this._analyser);
 
     // ── AudioWorklet for raw PCM ──────────────────────────────────────────
-    // The worklet file must be served from the same origin as the page.
     await this._ctx.audioWorklet.addModule('./processor.worklet.js');
 
     this._worklet = new AudioWorkletNode(this._ctx, 'capture-processor', {
-      // Request up to 2 input channels; the worklet handles mono gracefully
       channelCount:          2,
       channelCountMode:      'explicit',
       channelInterpretation: 'discrete',
     });
 
-    // The worklet posts complete FFT_SIZE windows back to the main thread
     const leftBuf  = this._left;
     const rightBuf = this._right;
     this._worklet.port.onmessage = (ev) => {
@@ -85,35 +132,33 @@ export class AudioCapture {
     };
 
     source.connect(this._worklet);
-    // Worklet must be connected to destination to keep the audio graph alive
     this._worklet.connect(this._ctx.destination);
 
     this._started = true;
   }
 
-  /** Stop the audio graph and release the microphone. */
+  /** Stop the audio graph and release all tracks. */
   stop() {
     if (!this._started) return;
     this._worklet?.disconnect();
     this._analyser?.disconnect();
     this._stream?.getTracks().forEach(t => t.stop());
     this._ctx?.close();
-    this._started = false;
+    this._ctx      = null;
+    this._analyser = null;
+    this._worklet  = null;
+    this._stream   = null;
+    this._started  = false;
   }
 
-  /** Returns true once audio is flowing. */
   get isRunning() { return this._started; }
 
-  /**
-   * The actual sample rate negotiated with the hardware.
-   * Only valid after start() has resolved.
-   */
+  /** The actual sample rate negotiated with the hardware. */
   get sampleRate() { return this._ctx?.sampleRate ?? 44100; }
 
   /**
    * Snapshot the current audio state.
    * Returns { fft: Float32Array, left: Float32Array, right: Float32Array }
-   * where fft contains linear magnitude values (not dBFS).
    */
   getFrame() {
     if (!this._analyser) {

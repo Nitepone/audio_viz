@@ -109,14 +109,16 @@
 <div id="toolbar">
   <label for="viz-select">Visualizer</label>
   <select id="viz-select"></select>
-  <button id="start-btn">Start</button>
+  <button id="start-btn">Microphone</button>
+  <button id="system-btn" style="display:none">System audio</button>
   <span id="status">Waiting for microphone…</span>
 </div>
 
 <div id="overlay">
   <h1>audio_viz</h1>
   <p>Microphone access is required. Click Start and accept the browser permission prompt.</p>
-  <button id="overlay-start-btn">Start</button>
+  <button id="overlay-start-btn">Start (microphone)</button>
+  <button id="overlay-system-btn" style="display:none">Start (system audio)</button>
 </div>
 
 <script type="module" src="main.js"></script>

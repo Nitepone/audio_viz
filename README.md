@@ -38,15 +38,19 @@ brew install --cask blackhole-2ch
 After installing, set BlackHole 2ch as your audio output in System Settings → Sound, or create a Multi-Output Device in Audio MIDI Setup to hear audio simultaneously while capturing it.
 
 ### Windows
-`cpal` on Windows captures from input devices only and cannot read directly from a playback device. [VB-Cable](https://vb-audio.com/Cable/) provides a virtual loopback device. It is not available via winget and must be installed manually:
+WASAPI exposes a loopback device for every output device automatically — no additional software required. Run `--list-devices` and look for entries ending in `[Loopback]`:
 
-1. Download VB-Cable from [vb-audio.com/Cable](https://vb-audio.com/Cable/) and run the installer as Administrator
-2. Reboot
-3. Set **CABLE Input** as your default playback device in Sound Settings
-4. Run `audio_viz --list-devices` to find the CABLE Output index
-5. Run `audio_viz --device "CABLE Output"`
+```powershell
+audio_viz --list-devices
+# Example output:
+#   [0] Speakers (High Definition Audio Device)
+#   [1] Speakers (High Definition Audio Device) [Loopback]   ← use this
+audio_viz --device "Speakers (High Definition Audio Device) [Loopback]"
+# or by index:
+audio_viz --device 1
+```
 
-To hear audio while visualizing, open the CABLE Output properties in Sound Settings, go to the Listen tab, and enable "Listen to this device".
+If no `[Loopback]` entries appear (some driver versions omit them), install [VB-Cable](https://vb-audio.com/Cable/) as a fallback — download and run the installer as Administrator, reboot, then set **CABLE Input** as your default playback device and use **CABLE Output** as the capture device.
 
 ---
 
