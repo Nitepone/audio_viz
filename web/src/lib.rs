@@ -255,6 +255,9 @@ fn make_viz(name: &str) -> Box<dyn Visualizer> {
         "lissajous" => Box::new(lissajous::LissajousViz::new("microphone")),
         "fire"      => Box::new(fire     ::FireViz     ::new("microphone")),
         "vu"        => Box::new(vu       ::VuViz       ::new("microphone")),
+        "pulsar"    => Box::new(pulsar   ::PulsarViz   ::new("microphone")),
+        "orbit"     => Box::new(orbit    ::OrbitViz    ::new("microphone")),
+        "plasma"    => Box::new(plasma   ::PlasmaViz   ::new("microphone")),
         _           => Box::new(spectrum ::SpectrumViz ::new("microphone")),
     }
 }
