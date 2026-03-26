@@ -801,36 +801,264 @@ impl SettingsOverlay {
 
 // ── Visualizer picker ─────────────────────────────────────────────────────────
 //
-// A full-screen overlay that lists all registered visualizers.
-// Opened with Esc when no other overlay is active.
-// Navigation: ↑/↓ to move, Enter to switch, Esc to cancel.
+// A two-level modal overlay for selecting a visualizer.
+//
+// Level 1 — Category list: opened with Esc when nothing else is active.
+// Level 2 — Visualizer list within a category: opened by pressing Enter on a
+//            category row.
+//
+// Navigation (both levels): ↑/↓ move cursor, Enter descends/selects, Esc
+// goes back one level (or closes the picker from the category level).
+
+/// Which level the picker is currently displaying.
+enum PickerLevel {
+    /// Showing the list of categories.  `cursor` is the highlighted category.
+    Category { cursor: usize },
+    /// Showing the visualizers inside one category.
+    Visualizer { category_idx: usize, cursor: usize },
+}
 
 struct VizPicker {
-    /// Names of all available visualizers, in registry order.
-    names:       Vec<String>,
-    /// One-line descriptions.
-    descs:       Vec<String>,
-    /// Index of the currently active visualizer (highlighted on open).
-    active:      usize,
-    /// Currently highlighted row.
-    cursor:      usize,
+    /// (display_name, [(viz_name, viz_desc)])
+    categories:  Vec<(String, Vec<(String, String)>)>,
+    /// Name of the currently running visualizer.
+    active_name: String,
+    level:       PickerLevel,
 }
 
 impl VizPicker {
-    fn open(all_vizs: &[Box<dyn Visualizer>], current_name: &str) -> Self {
-        let names: Vec<String> = all_vizs.iter().map(|v| v.name().to_string()).collect();
-        let descs: Vec<String> = all_vizs.iter().map(|v| v.description().to_string()).collect();
-        let active = names.iter().position(|n| n == current_name).unwrap_or(0);
-        Self { names, descs, active, cursor: active }
+    /// Build a picker pre-focused on the category that contains `current_name`.
+    fn open(categories: &[(String, Vec<(String, String)>)], current_name: &str) -> Self {
+        // Find which category the active visualizer lives in.
+        let active_cat = categories
+            .iter()
+            .position(|(_, vizs)| vizs.iter().any(|(n, _)| n == current_name))
+            .unwrap_or(0);
+        Self {
+            categories:  categories.to_vec(),
+            active_name: current_name.to_string(),
+            level:       PickerLevel::Category { cursor: active_cat },
+        }
+    }
+
+    /// If the picker is about to switch visualizers, return the chosen name.
+    /// Called from the Enter handler.  Returns `None` when Enter just drills
+    /// into a category rather than selecting a visualizer.
+    fn enter(&mut self) -> Option<String> {
+        match &self.level {
+            PickerLevel::Category { cursor } => {
+                let cat_idx = *cursor;
+                // Pre-highlight the active visualizer if it's in this category.
+                let viz_cursor = self.categories[cat_idx]
+                    .1
+                    .iter()
+                    .position(|(n, _)| *n == self.active_name)
+                    .unwrap_or(0);
+                self.level = PickerLevel::Visualizer { category_idx: cat_idx, cursor: viz_cursor };
+                None
+            }
+            PickerLevel::Visualizer { category_idx, cursor } => {
+                let name = self.categories[*category_idx].1[*cursor].0.clone();
+                Some(name)
+            }
+        }
+    }
+
+    /// Move cursor up within the current level.
+    fn up(&mut self) {
+        match &mut self.level {
+            PickerLevel::Category { cursor } => { if *cursor > 0 { *cursor -= 1; } }
+            PickerLevel::Visualizer { cursor, .. } => { if *cursor > 0 { *cursor -= 1; } }
+        }
+    }
+
+    /// Move cursor down within the current level.
+    fn down(&mut self) {
+        match &mut self.level {
+            PickerLevel::Category { cursor } => {
+                if *cursor + 1 < self.categories.len() { *cursor += 1; }
+            }
+            PickerLevel::Visualizer { category_idx, cursor } => {
+                if *cursor + 1 < self.categories[*category_idx].1.len() { *cursor += 1; }
+            }
+        }
+    }
+
+    /// Escape: go back to category level, or signal that the picker should
+    /// close (returns `true` when the picker should be dismissed).
+    fn escape(&mut self) -> bool {
+        match &self.level {
+            PickerLevel::Visualizer { category_idx, .. } => {
+                let cat = *category_idx;
+                self.level = PickerLevel::Category { cursor: cat };
+                false
+            }
+            PickerLevel::Category { .. } => true,
+        }
     }
 
     /// Render the picker as a centred modal over `base`.
     fn render_over(&self, base: &[String], size: TermSize) -> Vec<String> {
+        match &self.level {
+            PickerLevel::Category { cursor } =>
+                self.render_category_level(*cursor, base, size),
+            PickerLevel::Visualizer { category_idx, cursor } =>
+                self.render_visualizer_level(*category_idx, *cursor, base, size),
+        }
+    }
+
+    // ── shared helper: overwrite a region of one rendered row ─────────────────
+
+    fn overwrite(row: &mut String, col_start: usize, text: &str) {
+        let text_vis: String = {
+            let mut s = String::new();
+            let mut ch = text.chars();
+            while let Some(c) = ch.next() {
+                if c == '\x1b' { for x in ch.by_ref() { if x == 'm' { break; } } }
+                else { s.push(c); }
+            }
+            s
+        };
+        let tlen = text_vis.chars().count();
+        let raw_chars: Vec<char> = row.chars().collect();
+        let mut result = String::with_capacity(row.len() + text.len());
+        let mut dcol = 0usize;
+        let mut ri   = 0usize;
+        while dcol < col_start && ri < raw_chars.len() {
+            if raw_chars[ri] == '\x1b' {
+                result.push(raw_chars[ri]); ri += 1;
+                while ri < raw_chars.len() && raw_chars[ri] != 'm' { result.push(raw_chars[ri]); ri += 1; }
+                if ri < raw_chars.len() { result.push(raw_chars[ri]); ri += 1; }
+            } else { result.push(raw_chars[ri]); ri += 1; dcol += 1; }
+        }
+        result.push_str("\x1b[0m");
+        result.push_str(text);
+        result.push_str("\x1b[0m");
+        let mut skipped = 0usize;
+        while skipped < tlen && ri < raw_chars.len() {
+            if raw_chars[ri] == '\x1b' {
+                ri += 1;
+                while ri < raw_chars.len() && raw_chars[ri] != 'm' { ri += 1; }
+                if ri < raw_chars.len() { ri += 1; }
+            } else { ri += 1; skipped += 1; }
+        }
+        while ri < raw_chars.len() { result.push(raw_chars[ri]); ri += 1; }
+        *row = result;
+    }
+
+    fn draw_box(out: &mut Vec<String>, rows: usize, cols: usize,
+                box_row: usize, box_col: usize, box_h: usize, box_w: usize,
+                inner_w: usize, content_fn: impl Fn(usize, usize) -> String) {
+        if box_row < rows {
+            Self::overwrite(&mut out[box_row], box_col,
+                &format!("\x1b[1m\x1b[38;5;255m╔{}╗\x1b[0m", "═".repeat(inner_w)));
+        }
+        let bot = box_row + box_h.saturating_sub(1);
+        if bot < rows {
+            Self::overwrite(&mut out[bot], box_col,
+                &format!("\x1b[1m\x1b[38;5;255m╚{}╝\x1b[0m", "═".repeat(inner_w)));
+        }
+        for r in (box_row + 1)..bot {
+            if r >= rows { break; }
+            let content = content_fn(r - box_row - 1, inner_w);
+            let side = format!("\x1b[1m\x1b[38;5;255m║\x1b[0m{}\x1b[1m\x1b[38;5;255m║\x1b[0m", content);
+            Self::overwrite(&mut out[r], box_col, &side);
+        }
+        let _ = (cols, box_w); // suppress unused warnings
+    }
+
+    // ── Level 1: category list ────────────────────────────────────────────────
+
+    fn render_category_level(&self, cursor: usize, base: &[String], size: TermSize) -> Vec<String> {
         let rows = size.rows as usize;
         let cols = size.cols as usize;
+        let n    = self.categories.len();
 
-        let n       = self.names.len();
-        let box_h   = (n + 4).min(rows.saturating_sub(2)); // title+blank+items+hint+border
+        let box_h   = (n + 4).min(rows.saturating_sub(2));
+        let box_w   = (52usize).min(cols.saturating_sub(4));
+        let box_row = (rows.saturating_sub(box_h)) / 2;
+        let box_col = (cols.saturating_sub(box_w)) / 2;
+        let inner_w = box_w.saturating_sub(2);
+
+        let mut out: Vec<String> = base.to_vec();
+        while out.len() < rows { out.push(" ".repeat(cols)); }
+
+        // Which category contains the active visualizer?
+        let active_cat = self.categories
+            .iter()
+            .position(|(_, vizs)| vizs.iter().any(|(n, _)| *n == self.active_name))
+            .unwrap_or(usize::MAX);
+
+        Self::draw_box(&mut out, rows, cols, box_row, box_col, box_h, box_w, inner_w, |inner_row, w| {
+            match inner_row {
+                0 => {
+                    let title = "[ SELECT CATEGORY ]";
+                    let pad = w.saturating_sub(title.len()) / 2;
+                    format!("\x1b[1m\x1b[38;5;255m{}{:<width$}\x1b[0m",
+                        " ".repeat(pad), title, width = w.saturating_sub(pad))
+                }
+                1 => " ".repeat(w),
+                r if r >= 2 && r < 2 + n => {
+                    let idx       = r - 2;
+                    let focused   = idx == cursor;
+                    let has_active = idx == active_cat;
+                    let (cat_name, vizs) = &self.categories[idx];
+                    let display   = Self::capitalize(cat_name);
+                    let count     = format!("({} visualizers)", vizs.len());
+                    let name_w    = 14usize;
+                    let count_w   = w.saturating_sub(name_w + 4);
+
+                    let indicator = if has_active && focused { "▶●" }
+                                    else if has_active       { " ●" }
+                                    else if focused          { "▶ " }
+                                    else                     { "  " };
+
+                    let ind_col = if focused {
+                        format!("\x1b[1m\x1b[38;5;33m{}\x1b[0m ", indicator)
+                    } else {
+                        format!("\x1b[38;5;238m{}\x1b[0m ", indicator)
+                    };
+                    let name_col = if focused {
+                        format!("\x1b[1m\x1b[38;5;33m{:<nw$}\x1b[0m", display, nw = name_w)
+                    } else if has_active {
+                        format!("\x1b[38;5;255m{:<nw$}\x1b[0m", display, nw = name_w)
+                    } else {
+                        format!("\x1b[38;5;244m{:<nw$}\x1b[0m", display, nw = name_w)
+                    };
+                    let count_col = {
+                        let truncated: String = count.chars().take(count_w).collect();
+                        if focused {
+                            format!("\x1b[38;5;250m {:<dw$}\x1b[0m", truncated, dw = count_w)
+                        } else {
+                            format!("\x1b[38;5;238m {:<dw$}\x1b[0m", truncated, dw = count_w)
+                        }
+                    };
+                    format!("{}{}{}", ind_col, name_col, count_col)
+                }
+                r if r == 2 + n => " ".repeat(w),
+                r if r == 3 + n => {
+                    let hint = " [↑↓] Navigate  [↵] Open  [Esc] Close ";
+                    let pad  = w.saturating_sub(hint.len()) / 2;
+                    format!("\x1b[2m\x1b[38;5;240m{}{:<width$}\x1b[0m",
+                        " ".repeat(pad), hint, width = w.saturating_sub(pad))
+                }
+                _ => " ".repeat(w),
+            }
+        });
+
+        out
+    }
+
+    // ── Level 2: visualizer list within a category ────────────────────────────
+
+    fn render_visualizer_level(&self, category_idx: usize, cursor: usize,
+                                base: &[String], size: TermSize) -> Vec<String> {
+        let rows = size.rows as usize;
+        let cols = size.cols as usize;
+        let (cat_name, vizs) = &self.categories[category_idx];
+        let n = vizs.len();
+
+        let box_h   = (n + 4).min(rows.saturating_sub(2));
         let box_w   = (62usize).min(cols.saturating_sub(4));
         let box_row = (rows.saturating_sub(box_h)) / 2;
         let box_col = (cols.saturating_sub(box_w)) / 2;
@@ -839,122 +1067,73 @@ impl VizPicker {
         let mut out: Vec<String> = base.to_vec();
         while out.len() < rows { out.push(" ".repeat(cols)); }
 
-        let overwrite = |row: &mut String, col_start: usize, text: &str| {
-            let text_vis: String = {
-                let mut s = String::new();
-                let mut ch = text.chars();
-                while let Some(c) = ch.next() {
-                    if c == '\x1b' { for x in ch.by_ref() { if x == 'm' { break; } } }
-                    else { s.push(c); }
-                }
-                s
-            };
-            let tlen = text_vis.chars().count();
-            let raw_chars: Vec<char> = row.chars().collect();
-            let mut result = String::with_capacity(row.len() + text.len());
-            let mut dcol = 0usize;
-            let mut ri   = 0usize;
-            while dcol < col_start && ri < raw_chars.len() {
-                if raw_chars[ri] == '\x1b' {
-                    result.push(raw_chars[ri]); ri += 1;
-                    while ri < raw_chars.len() && raw_chars[ri] != 'm' { result.push(raw_chars[ri]); ri += 1; }
-                    if ri < raw_chars.len() { result.push(raw_chars[ri]); ri += 1; }
-                } else { result.push(raw_chars[ri]); ri += 1; dcol += 1; }
-            }
-            result.push_str("\x1b[0m");
-            result.push_str(text);
-            result.push_str("\x1b[0m");
-            let mut skipped = 0usize;
-            while skipped < tlen && ri < raw_chars.len() {
-                if raw_chars[ri] == '\x1b' {
-                    ri += 1;
-                    while ri < raw_chars.len() && raw_chars[ri] != 'm' { ri += 1; }
-                    if ri < raw_chars.len() { ri += 1; }
-                } else { ri += 1; skipped += 1; }
-            }
-            while ri < raw_chars.len() { result.push(raw_chars[ri]); ri += 1; }
-            *row = result;
-        };
+        let active_name = &self.active_name;
+        let display_cat = Self::capitalize(cat_name);
 
-        // Top border
-        if box_row < rows {
-            overwrite(&mut out[box_row], box_col,
-                &format!("\x1b[1m\x1b[38;5;255m╔{}╗\x1b[0m", "═".repeat(inner_w)));
-        }
-        // Bottom border
-        let bot = box_row + box_h.saturating_sub(1);
-        if bot < rows {
-            overwrite(&mut out[bot], box_col,
-                &format!("\x1b[1m\x1b[38;5;255m╚{}╝\x1b[0m", "═".repeat(inner_w)));
-        }
-        // Content rows
-        for r in (box_row + 1)..bot {
-            if r >= rows { break; }
-            let content = self.row_content(r - box_row - 1, inner_w);
-            let side = format!("\x1b[1m\x1b[38;5;255m║\x1b[0m{}\x1b[1m\x1b[38;5;255m║\x1b[0m", content);
-            overwrite(&mut out[r], box_col, &side);
-        }
+        Self::draw_box(&mut out, rows, cols, box_row, box_col, box_h, box_w, inner_w, |inner_row, w| {
+            match inner_row {
+                0 => {
+                    let title = format!("[ {} ]", display_cat.to_uppercase());
+                    let pad = w.saturating_sub(title.len()) / 2;
+                    format!("\x1b[1m\x1b[38;5;255m{}{:<width$}\x1b[0m",
+                        " ".repeat(pad), title, width = w.saturating_sub(pad))
+                }
+                1 => " ".repeat(w),
+                r if r >= 2 && r < 2 + n => {
+                    let idx      = r - 2;
+                    let focused  = idx == cursor;
+                    let active   = vizs[idx].0 == *active_name;
+                    let name     = &vizs[idx].0;
+                    let desc     = &vizs[idx].1;
+                    let name_w   = 12usize;
+                    let desc_w   = w.saturating_sub(name_w + 4);
+
+                    let indicator = if active && focused { "▶●" }
+                                    else if active       { " ●" }
+                                    else if focused      { "▶ " }
+                                    else                 { "  " };
+
+                    let ind_col = if focused {
+                        format!("\x1b[1m\x1b[38;5;33m{}\x1b[0m ", indicator)
+                    } else {
+                        format!("\x1b[38;5;238m{}\x1b[0m ", indicator)
+                    };
+                    let name_col = if focused {
+                        format!("\x1b[1m\x1b[38;5;33m{:<nw$}\x1b[0m", name, nw = name_w)
+                    } else if active {
+                        format!("\x1b[38;5;255m{:<nw$}\x1b[0m", name, nw = name_w)
+                    } else {
+                        format!("\x1b[38;5;244m{:<nw$}\x1b[0m", name, nw = name_w)
+                    };
+                    let desc_col = {
+                        let truncated: String = desc.chars().take(desc_w).collect();
+                        if focused {
+                            format!("\x1b[38;5;250m {:<dw$}\x1b[0m", truncated, dw = desc_w)
+                        } else {
+                            format!("\x1b[38;5;238m {:<dw$}\x1b[0m", truncated, dw = desc_w)
+                        }
+                    };
+                    format!("{}{}{}", ind_col, name_col, desc_col)
+                }
+                r if r == 2 + n => " ".repeat(w),
+                r if r == 3 + n => {
+                    let hint = " [↑↓] Navigate  [↵] Switch  [Esc] Back ";
+                    let pad  = w.saturating_sub(hint.len()) / 2;
+                    format!("\x1b[2m\x1b[38;5;240m{}{:<width$}\x1b[0m",
+                        " ".repeat(pad), hint, width = w.saturating_sub(pad))
+                }
+                _ => " ".repeat(w),
+            }
+        });
 
         out
     }
 
-    fn row_content(&self, inner_row: usize, w: usize) -> String {
-        let n = self.names.len();
-        match inner_row {
-            0 => {
-                let title = "[ VISUALIZERS ]";
-                let pad   = w.saturating_sub(title.len()) / 2;
-                format!("\x1b[1m\x1b[38;5;255m{}{:<width$}\x1b[0m",
-                    " ".repeat(pad), title, width = w.saturating_sub(pad))
-            }
-            1 => " ".repeat(w),
-            r if r >= 2 && r < 2 + n => {
-                let idx      = r - 2;
-                let focused  = idx == self.cursor;
-                let active   = idx == self.active;
-                let name     = &self.names[idx];
-                let desc     = &self.descs[idx];
-                let name_w   = 12usize;
-                let desc_w   = w.saturating_sub(name_w + 4); // 2 indicator + 2 padding
-
-                let indicator = if active && focused { "▶●" }
-                                else if active       { " ●" }
-                                else if focused      { "▶ " }
-                                else                 { "  " };
-
-                let name_col = if focused {
-                    format!("\x1b[1m\x1b[38;5;33m{:<nw$}\x1b[0m", name, nw = name_w)
-                } else if active {
-                    format!("\x1b[38;5;255m{:<nw$}\x1b[0m", name, nw = name_w)
-                } else {
-                    format!("\x1b[38;5;244m{:<nw$}\x1b[0m", name, nw = name_w)
-                };
-
-                let desc_col = {
-                    let truncated: String = desc.chars().take(desc_w).collect();
-                    if focused {
-                        format!("\x1b[38;5;250m {:<dw$}\x1b[0m", truncated, dw = desc_w)
-                    } else {
-                        format!("\x1b[38;5;238m {:<dw$}\x1b[0m", truncated, dw = desc_w)
-                    }
-                };
-
-                let ind_col = if focused {
-                    format!("\x1b[1m\x1b[38;5;33m{}\x1b[0m ", indicator)
-                } else {
-                    format!("\x1b[38;5;238m{}\x1b[0m ", indicator)
-                };
-
-                format!("{}{}{}", ind_col, name_col, desc_col)
-            }
-            r if r == 2 + n => " ".repeat(w),
-            r if r == 3 + n => {
-                let hint = " [↑↓] Navigate  [↵] Switch  [Esc] Cancel ";
-                let pad  = w.saturating_sub(hint.len()) / 2;
-                format!("\x1b[2m\x1b[38;5;240m{}{:<width$}\x1b[0m",
-                    " ".repeat(pad), hint, width = w.saturating_sub(pad))
-            }
-            _ => " ".repeat(w),
+    fn capitalize(s: &str) -> String {
+        let mut c = s.chars();
+        match c.next() {
+            None    => String::new(),
+            Some(f) => f.to_uppercase().to_string() + c.as_str(),
         }
     }
 }
@@ -1165,8 +1344,27 @@ fn main() -> anyhow::Result<()> {
     let mut overlay: Option<SettingsOverlay> = None;
     // Visualizer picker state: None = closed, Some = open
     let mut viz_picker: Option<VizPicker> = None;
-    // Snapshot of registered visualizer metadata for the picker
-    let all_viz_meta: Vec<Box<dyn Visualizer>> = visualizers::all_visualizers();
+    // Pre-build category data (names + descriptions) for the two-level picker.
+    let viz_categories: Vec<(String, Vec<(String, String)>)> = {
+        let all_desc = visualizers::all_visualizers();
+        visualizers::visualizer_categories()
+            .into_iter()
+            .map(|(cat, names)| {
+                let entries = names
+                    .into_iter()
+                    .map(|n| {
+                        let desc = all_desc
+                            .iter()
+                            .find(|v| v.name() == n)
+                            .map(|v| v.description().to_string())
+                            .unwrap_or_default();
+                        (n.to_string(), desc)
+                    })
+                    .collect();
+                (cat.to_string(), entries)
+            })
+            .collect()
+    };
     // Cache the last rendered visualizer frame for compositing with the overlay
     let mut last_frame: Vec<String> = Vec::new();
 
@@ -1210,28 +1408,27 @@ fn main() -> anyhow::Result<()> {
                 Event::Key(KeyEvent { code: KeyCode::Esc, .. })
                     if overlay.is_none() && viz_picker.is_none() =>
                 {
-                    viz_picker = Some(VizPicker::open(&all_viz_meta, viz.name()));
+                    viz_picker = Some(VizPicker::open(&viz_categories, viz.name()));
                 }
 
                 // ── Visualizer picker navigation ──────────────────────────────
                 Event::Key(kev) if viz_picker.is_some() && overlay.is_none() => {
                     let vp = viz_picker.as_mut().unwrap();
                     match kev.code {
-                        KeyCode::Esc => { viz_picker = None; }
-                        KeyCode::Up => {
-                            if vp.cursor > 0 { vp.cursor -= 1; }
+                        KeyCode::Esc => {
+                            if vp.escape() { viz_picker = None; }
                         }
-                        KeyCode::Down => {
-                            if vp.cursor + 1 < vp.names.len() { vp.cursor += 1; }
-                        }
+                        KeyCode::Up   => { vp.up(); }
+                        KeyCode::Down => { vp.down(); }
                         KeyCode::Enter => {
-                            let chosen = vp.names[vp.cursor].clone();
-                            viz_picker = None;
-                            if chosen != viz.name() {
-                                viz = make_viz(&chosen, &device_name);
-                                viz.on_resize(size);
-                                execute!(stdout, terminal::Clear(ClearType::All))?;
-                                last_frame.clear();
+                            if let Some(chosen) = vp.enter() {
+                                viz_picker = None;
+                                if chosen != viz.name() {
+                                    viz = make_viz(&chosen, &device_name);
+                                    viz.on_resize(size);
+                                    execute!(stdout, terminal::Clear(ClearType::All))?;
+                                    last_frame.clear();
+                                }
                             }
                         }
                         _ => {}
