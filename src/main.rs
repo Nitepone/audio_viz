@@ -1554,7 +1554,7 @@ fn main() -> anyhow::Result<()> {
                                 ov.text_buf.clear();
                                 ov.editing = false;
                                 ov.err_msg = None;
-                                if ov.cursor + 1 < n { ov.cursor += 1; }
+                                ov.cursor = (ov.cursor + 1) % n.max(1);
                             }
                         }
 
