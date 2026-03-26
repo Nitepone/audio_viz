@@ -184,10 +184,11 @@ function applySettings() {
 function loadSettings(name) {
   if (!viz) return;
   const saved = localStorage.getItem(STORAGE_PREFIX + name);
+  let configJson;
   if (saved) {
-    try { viz.set_config(saved); } catch { /* ignore stale data */ }
+    try { configJson = viz.set_config(saved); } catch { /* ignore stale data */ }
   }
-  buildSettingsUI(viz.get_config());
+  buildSettingsUI(configJson || viz.get_config());
 }
 
 // ── Resize handling ───────────────────────────────────────────────────────────
