@@ -229,6 +229,17 @@ impl WebViz {
         serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
     }
 
+    /// Return visualizer categories as a JSON array of [category, [name, ...]] pairs.
+    ///
+    /// Example:
+    /// ```json
+    /// [["frequency", ["radial", "spectrum", "vu"]], ["scopes", ["lissajous", "scope"]]]
+    /// ```
+    pub fn all_categories() -> String {
+        let cats = visualizers::visualizer_categories();
+        serde_json::to_string(&cats).unwrap_or_else(|_| "[]".to_string())
+    }
+
     /// Return the default config JSON for this visualizer.
     pub fn get_config(&self) -> String {
         self.viz.get_default_config()
@@ -246,20 +257,16 @@ impl WebViz {
 }
 
 fn make_viz(name: &str) -> Box<dyn Visualizer> {
-    use audio_viz::visualizers::*;
-    match name {
-        "spectrum"  => Box::new(spectrum ::SpectrumViz ::new("microphone")),
-        "scope"     => Box::new(scope    ::ScopeViz    ::new("microphone")),
-        "matrix"    => Box::new(matrix   ::MatrixViz   ::new("microphone")),
-        "radial"    => Box::new(radial   ::RadialViz   ::new("microphone")),
-        "lissajous" => Box::new(lissajous::LissajousViz::new("microphone")),
-        "fire"      => Box::new(fire     ::FireViz     ::new("microphone")),
-        "vu"        => Box::new(vu       ::VuViz       ::new("microphone")),
-        "pulsar"    => Box::new(pulsar   ::PulsarViz   ::new("microphone")),
-        "orbit"     => Box::new(orbit    ::OrbitViz    ::new("microphone")),
-        "plasma"    => Box::new(plasma   ::PlasmaViz   ::new("microphone")),
-        _           => Box::new(spectrum ::SpectrumViz ::new("microphone")),
+    let mut all = visualizers::all_visualizers();
+    if let Some(pos) = all.iter().position(|v| v.name() == name) {
+        return all.swap_remove(pos);
     }
+    // Fallback: first registered visualizer
+    if !all.is_empty() {
+        return all.swap_remove(0);
+    }
+    // Should never be reached if at least one visualizer is registered
+    unreachable!("no visualizers registered")
 }
 
 #[cfg(target_arch = "wasm32")]

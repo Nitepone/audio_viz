@@ -9,14 +9,17 @@ import { AudioCapture } from './audio.js';
 import { Renderer }     from './renderer.js';
 import init, { WebViz } from './pkg/audio_viz_web.js';
 
-const canvas       = document.getElementById('canvas');
-const vizSelect    = document.getElementById('viz-select');
-const startBtn     = document.getElementById('start-btn');
-const systemBtn    = document.getElementById('system-btn');
-const overlayEl    = document.getElementById('overlay');
-const overlayStart = document.getElementById('overlay-start-btn');
+const canvas        = document.getElementById('canvas');
+const catSelect     = document.getElementById('cat-select');
+const vizSelect     = document.getElementById('viz-select');
+const settingsBtn   = document.getElementById('settings-btn');
+const settingsPanel = document.getElementById('settings-panel');
+const startBtn      = document.getElementById('start-btn');
+const systemBtn     = document.getElementById('system-btn');
+const overlayEl     = document.getElementById('overlay');
+const overlayStart  = document.getElementById('overlay-start-btn');
 const overlaySystem = document.getElementById('overlay-system-btn');
-const statusEl     = document.getElementById('status');
+const statusEl      = document.getElementById('status');
 
 const audio    = new AudioCapture();
 const renderer = new Renderer(canvas);
@@ -31,18 +34,28 @@ let fpsSmooth  = 0;
 
 // ── Initialise WASM ───────────────────────────────────────────────────────────
 
+// categories: Array of [categoryName, [vizName, ...]] pairs, populated on init.
+let categories = [];
+
 async function initWasm() {
   wasm = await init();
 
-  const names = JSON.parse(WebViz.all_names());
-  for (const name of names) {
-    const opt  = document.createElement('option');
-    opt.value  = name;
-    opt.text   = name;
-    if (name === 'scope') opt.selected = true;
-    vizSelect.appendChild(opt);
+  categories = JSON.parse(WebViz.all_categories());
+
+  // Populate category dropdown
+  for (const [cat] of categories) {
+    const opt = document.createElement('option');
+    opt.value = cat;
+    opt.text  = cat;
+    catSelect.appendChild(opt);
   }
 
+  // Default to whichever category contains 'scope', else first category
+  const defaultCat = categories.find(([, names]) => names.includes('scope'))?.[0]
+    ?? categories[0]?.[0];
+  if (defaultCat) catSelect.value = defaultCat;
+
+  populateVizSelect(catSelect.value, 'scope');
   makeViz(vizSelect.value);
 
   // Show system audio button only on supported browsers (Chrome/Edge desktop)
@@ -52,9 +65,129 @@ async function initWasm() {
   }
 }
 
+function populateVizSelect(catName, preferredViz = null) {
+  vizSelect.innerHTML = '';
+  const entry = categories.find(([cat]) => cat === catName);
+  if (!entry) return;
+  const [, names] = entry;
+  for (const name of names) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.text  = name;
+    if (name === preferredViz) opt.selected = true;
+    vizSelect.appendChild(opt);
+  }
+}
+
 function makeViz(name) {
   viz?.free?.();
   viz = new WebViz(name, renderer.cols, renderer.rows);
+  loadSettings(name);
+}
+
+// ── Settings UI ───────────────────────────────────────────────────────────────
+
+const STORAGE_PREFIX = 'audio_viz_config_';
+
+function buildSettingsUI(schemaJson) {
+  settingsPanel.innerHTML = '';
+  let schema;
+  try { schema = JSON.parse(schemaJson); } catch { return; }
+  const config = schema.config ?? [];
+  if (config.length === 0) return;
+
+  for (const entry of config) {
+    const wrap = document.createElement('div');
+    wrap.className = 'setting';
+
+    const lbl = document.createElement('label');
+    lbl.textContent = entry.display_name ?? entry.name;
+
+    wrap.appendChild(lbl);
+
+    if (entry.type === 'float' || entry.type === 'int') {
+      const min  = entry.min  ?? 0;
+      const max  = entry.max  ?? 1;
+      const step = entry.type === 'int' ? 1 : (max - min) / 200;
+      const val  = entry.value ?? min;
+
+      const slider = document.createElement('input');
+      slider.type  = 'range';
+      slider.min   = min;
+      slider.max   = max;
+      slider.step  = step;
+      slider.value = val;
+      slider.dataset.name = entry.name;
+      slider.dataset.type = entry.type;
+
+      const readout = document.createElement('span');
+      readout.className   = 'setting-val';
+      readout.textContent = entry.type === 'int' ? val : Number(val).toFixed(2);
+
+      slider.addEventListener('input', () => {
+        readout.textContent = entry.type === 'int'
+          ? slider.value
+          : Number(slider.value).toFixed(2);
+        applySettings();
+      });
+
+      wrap.appendChild(slider);
+      wrap.appendChild(readout);
+
+    } else if (entry.type === 'enum') {
+      const sel = document.createElement('select');
+      sel.dataset.name = entry.name;
+      sel.dataset.type = 'enum';
+      for (const v of (entry.variants ?? [])) {
+        const opt = document.createElement('option');
+        opt.value    = v;
+        opt.text     = v;
+        opt.selected = v === entry.value;
+        sel.appendChild(opt);
+      }
+      sel.addEventListener('change', applySettings);
+      wrap.appendChild(sel);
+
+    } else if (entry.type === 'bool') {
+      const cb = document.createElement('input');
+      cb.type           = 'checkbox';
+      cb.checked        = !!entry.value;
+      cb.dataset.name   = entry.name;
+      cb.dataset.type   = 'bool';
+      cb.addEventListener('change', applySettings);
+      wrap.appendChild(cb);
+    }
+
+    settingsPanel.appendChild(wrap);
+  }
+}
+
+function applySettings() {
+  if (!viz) return;
+  const controls = settingsPanel.querySelectorAll('[data-name]');
+  const entries  = [];
+  for (const ctrl of controls) {
+    const type = ctrl.dataset.type;
+    let value;
+    if (type === 'bool')       value = ctrl.checked;
+    else if (type === 'float') value = parseFloat(ctrl.value);
+    else if (type === 'int')   value = parseInt(ctrl.value, 10);
+    else                       value = ctrl.value;
+    entries.push({ name: ctrl.dataset.name, value });
+  }
+  const partial = JSON.stringify({ config: entries });
+  const merged  = viz.set_config(partial);
+  const name    = viz.name();
+  try { localStorage.setItem(STORAGE_PREFIX + name, merged); } catch { /* quota */ }
+}
+
+function loadSettings(name) {
+  if (!viz) return;
+  const saved = localStorage.getItem(STORAGE_PREFIX + name);
+  if (saved) {
+    try { viz.set_config(saved); } catch { /* ignore stale data */ }
+  }
+  buildSettingsUI(viz.get_config());
 }
 
 // ── Resize handling ───────────────────────────────────────────────────────────
@@ -144,7 +277,20 @@ systemBtn.addEventListener('click',   () => start('system'));
 overlayStart.addEventListener('click',  () => start('mic'));
 overlaySystem.addEventListener('click', () => start('system'));
 
+// ── Settings toggle ───────────────────────────────────────────────────────────
+
+settingsBtn.addEventListener('click', () => {
+  const open = settingsPanel.classList.toggle('open');
+  settingsBtn.classList.toggle('active', open);
+  settingsBtn.textContent = open ? 'Settings ▲' : 'Settings ▼';
+});
+
 // ── Visualizer switching ──────────────────────────────────────────────────────
+
+catSelect.addEventListener('change', () => {
+  populateVizSelect(catSelect.value);
+  makeViz(vizSelect.value);
+});
 
 vizSelect.addEventListener('change', () => makeViz(vizSelect.value));
 
