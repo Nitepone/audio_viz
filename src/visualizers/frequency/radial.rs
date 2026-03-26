@@ -41,7 +41,7 @@ impl RadialViz {
             theta:       Vec::new(),
             cached_rows: 0,
             cached_cols: 0,
-            gain:        1.0,
+            gain:        2.0,
         }
     }
 
@@ -92,7 +92,7 @@ impl Visualizer for RadialViz {
                     "name": "gain",
                     "display_name": "Gain",
                     "type": "float",
-                    "value": 1.0,
+                    "value": 2.0,
                     "min": 0.0,
                     "max": 4.0
                 }
