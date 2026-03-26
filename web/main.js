@@ -283,6 +283,7 @@ settingsBtn.addEventListener('click', () => {
   const open = settingsPanel.classList.toggle('open');
   settingsBtn.classList.toggle('active', open);
   settingsBtn.textContent = open ? 'Settings ▲' : 'Settings ▼';
+  handleResize();
 });
 
 // ── Visualizer switching ──────────────────────────────────────────────────────
