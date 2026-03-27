@@ -1031,6 +1031,50 @@ static CONST_LINES: &[(u16, u16)] = &[
     (8278, 7936),  // beta — zeta Cap
 ];
 
+/// Constellation group index for each entry in CONST_LINES (parallel array).
+/// Group numbers are sequential per comment block in CONST_LINES.
+static CONST_LINE_GROUPS: &[u8] = &[
+    0, 0, 0, 0, 0, 0, 0, 0,                          // Orion (8)
+    1, 1, 1, 1, 1, 1, 1,                              // Ursa Major (7)
+    2, 2, 2, 2, 2, 2,                                 // Ursa Minor (6)
+    3, 3, 3, 3,                                       // Cassiopeia (4)
+    4, 4, 4, 4, 4,                                    // Perseus (5)
+    5, 5, 5, 5, 5,                                    // Auriga (5)
+    6, 6, 6, 6, 6, 6, 6,                              // Gemini (7)
+    7, 7, 7, 7, 7,                                    // Taurus (5)
+    8, 8, 8, 8, 8,                                    // Canis Major (5)
+    9,                                                // Canis Minor (1)
+    10, 10, 10, 10, 10, 10,                           // Leo (6)
+    11, 11, 11, 11,                                   // Virgo (4)
+    12, 12, 12, 12, 12,                               // Boötes (5)
+    13, 13, 13, 13, 13,                               // Corona Borealis (5)
+    14, 14, 14, 14, 14,                               // Hercules (5)
+    15, 15, 15, 15, 15, 15, 15, 15, 15,               // Scorpius (9)
+    16, 16, 16, 16, 16, 16, 16, 16,                   // Sagittarius (8)
+    17, 17, 17, 17,                                   // Lyra (4)
+    18, 18, 18, 18,                                   // Cygnus (4)
+    19, 19, 19, 19,                                   // Aquila (4)
+    20, 20, 20,                                       // Andromeda (3)
+    21, 21, 21, 21, 21,                               // Pegasus (5)
+    22, 22, 22,                                       // Crux (3)
+    23, 23, 23, 23, 23, 23,                           // Centaurus (6)
+    24, 24, 24, 24,                                   // Carina (4)
+    25, 25, 25, 25,                                   // Vela (4)
+    26, 26, 26,                                       // Puppis (3)
+    27, 27, 27, 27, 27,                               // Draco (5)
+    28, 28, 28, 28, 28,                               // Ophiuchus (5)
+    29, 29, 29, 29, 29,                               // Hydra (5)
+    30, 30, 30, 30,                                   // Corvus (4)
+    31, 31, 31,                                       // Libra (3)
+    32, 32, 32, 32,                                   // Eridanus (4)
+    33, 33, 33, 33,                                   // Aquarius (4)
+    34, 34,                                           // Grus (2)
+    35,                                               // Triangulum Australe (1)
+    36, 36, 36,                                       // Lupus (3)
+    37,                                               // Corona Australis (1)
+    38, 38, 38,                                       // Capricornus (3)
+];
+
 // ── Camera pan targets ────────────────────────────────────────────────────────
 // 30 visually rich constellations; centroid of main stars.
 // Format: (name, center_ra_rad, center_dec_rad)
@@ -1067,6 +1111,55 @@ static CONST_TARGETS: &[(&str, f32, f32)] = &[
     ("Triangulum Australe", 4.0000, -1.1200),
     ("Grus",                5.8700, -0.7600),
 ];
+
+/// Maps CONST_LINE_GROUPS group index → CONST_TARGETS index.
+/// 255 = constellation has no entry in CONST_TARGETS (no pan target).
+static LINE_GROUP_TARGET: &[u8] = &[
+    0,   // 0:  Orion
+    1,   // 1:  Ursa Major
+    255, // 2:  Ursa Minor
+    4,   // 3:  Cassiopeia
+    10,  // 4:  Perseus
+    255, // 5:  Auriga
+    8,   // 6:  Gemini
+    9,   // 7:  Taurus
+    16,  // 8:  Canis Major
+    255, // 9:  Canis Minor
+    7,   // 10: Leo
+    12,  // 11: Virgo
+    11,  // 12: Boötes
+    18,  // 13: Corona Borealis
+    17,  // 14: Hercules
+    2,   // 15: Scorpius
+    3,   // 16: Sagittarius
+    6,   // 17: Lyra
+    5,   // 18: Cygnus
+    13,  // 19: Aquila
+    21,  // 20: Andromeda
+    22,  // 21: Pegasus
+    14,  // 22: Crux
+    15,  // 23: Centaurus
+    26,  // 24: Carina
+    27,  // 25: Vela
+    255, // 26: Puppis
+    20,  // 27: Draco
+    19,  // 28: Ophiuchus
+    24,  // 29: Hydra
+    25,  // 30: Corvus
+    255, // 31: Libra
+    255, // 32: Eridanus
+    23,  // 33: Aquarius
+    29,  // 34: Grus
+    28,  // 35: Triangulum Australe
+    255, // 36: Lupus
+    255, // 37: Corona Australis
+    255, // 38: Capricornus
+];
+
+/// Muted line colors per group index (mod 8) for inactive constellations.
+const LINE_COLORS_DIM: [u8; 8] = [67, 64, 97, 136, 66, 131, 103, 130];
+/// Bright line colors per group index (mod 8) for the active constellation.
+const LINE_COLORS_LIT: [u8; 8] = [111, 112, 141, 220, 123, 210, 147, 172];
 
 // ── Deep-sky objects ──────────────────────────────────────────────────────────
 // Format: name, ra_rad, dec_rad, major_deg, minor_deg, pa_deg, ansi_color, step_deg
@@ -1234,7 +1327,7 @@ struct Camera {
 
 pub struct NightSkyViz {
     stars:          Vec<Star>,
-    lines:          Vec<(usize, usize)>,
+    lines:          Vec<(usize, usize, u8)>,
     pan_targets:    Vec<(f32, f32)>,
     pan_target_idx: usize,
     camera:         Camera,
@@ -1489,11 +1582,12 @@ impl NightSkyViz {
             }
         }
 
-        let lines: Vec<(usize, usize)> = CONST_LINES.iter()
-            .filter_map(|&(a, b)| {
+        let lines: Vec<(usize, usize, u8)> = CONST_LINES.iter()
+            .zip(CONST_LINE_GROUPS.iter())
+            .filter_map(|(&(a, b), &g)| {
                 let ia = *hr_to_idx.get(&a)?;
                 let ib = *hr_to_idx.get(&b)?;
-                Some((ia, ib))
+                Some((ia, ib, g))
             })
             .collect();
 
@@ -1945,14 +2039,18 @@ impl Visualizer for NightSkyViz {
 
         // ── Draw constellation lines ──────────────────────────────────────────
         if self.show_lines {
-            for &(ia, ib) in &self.lines {
+            for &(ia, ib, group) in &self.lines {
                 if ia >= self.stars.len() || ib >= self.stars.len() { continue; }
                 let sa = &self.stars[ia];
                 let sb = &self.stars[ib];
                 let pa = project(sa.ra, sa.dec, self.camera.ra, self.camera.dec, fov_h, v_scale, cols, vis);
                 let pb = project(sb.ra, sb.dec, self.camera.ra, self.camera.dec, fov_h, v_scale, cols, vis);
                 if let (Some((ca, ra)), Some((cb, rb))) = (pa, pb) {
-                    bresenham(&mut line_grid, cols, vis, ca, ra, cb, rb, 236);
+                    let gi = group as usize;
+                    let target = LINE_GROUP_TARGET[gi];
+                    let active = target != 255 && target as usize == self.pan_target_idx;
+                    let palette = if active { &LINE_COLORS_LIT } else { &LINE_COLORS_DIM };
+                    bresenham(&mut line_grid, cols, vis, ca, ra, cb, rb, palette[gi % palette.len()]);
                 }
             }
         }
@@ -2035,7 +2133,7 @@ impl Visualizer for NightSkyViz {
                     line.push_str(&s);
                 } else if line_grid[idx] != 0 {
                     let color = line_grid[idx];
-                    line.push_str(&ansi_dim_fg("·", color));
+                    line.push_str(&ansi_fg('·', color));
                 } else if dso_grid[idx].0 > 0.0 {
                     let (intensity, color) = dso_grid[idx];
                     line.push_str(&ansi_dim_fg(if intensity > 0.6 { "." } else { "·" }, color));
