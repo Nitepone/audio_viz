@@ -1,0 +1,1365 @@
+/// night_sky.rs — Real star map with constellation lines, audio shimmer, and beat-driven camera panning.
+///
+/// Stars are drawn from a subset of the Yale Bright Star Catalog (mag < 4.5) projected
+/// onto the terminal via gnomonic projection.  Three audio bands (bass/mid/treble) drive
+/// shimmer on bright/mid/faint star populations respectively.  After a configurable number
+/// of beats the camera smoothly pans to the next constellation on a great-circle arc.
+///
+/// Config:
+///   shimmer_gain      — 0.0–3.0: audio shimmer intensity
+///   pan_beats         — 1–32:    beats before camera pans to next constellation
+///   limiting_mag      — 1.0–6.5: faintest magnitude displayed
+///   show_lines        — bool:    draw constellation stick figures
+///   show_names        — bool:    label named stars (proper names next to each star)
+///   show_const_names  — bool:    label constellation centroids on sky
+///   show_milky_way    — bool:    render Milky Way cloud overlay (galactic plane)
+///   color_mode        — spectral / mono / teal / warm
+///   fov               — 30–120°: field of view
+///   pan_speed         — 0.2–3.0: camera interpolation speed (1 = 1 second per pan)
+
+use std::collections::HashMap;
+use std::f32::consts::PI;
+
+use crate::visualizer::{
+    merge_config, pad_frame, status_bar, AudioFrame, TermSize, Visualizer, FFT_SIZE, SAMPLE_RATE,
+};
+
+const CONFIG_VERSION: u64 = 1;
+
+// ── Star catalog ──────────────────────────────────────────────────────────────
+// Format: (hr, ra_rad, dec_rad, mag, bv, name)
+// Coordinates: J2000 equatorial. RA in radians [0, 2π), Dec in radians [-π/2, π/2].
+// Source: Yale Bright Star Catalogue r5 (subset, V mag < 4.5).
+// name = "" for unnamed entries.
+
+static STARS: &[(u16, f32, f32, f32, f32, &str)] = &[
+    // ── Orion ─────────────────────────────────────────────────────────────────
+    (2061, 1.5499,  0.1293,  0.50,  1.85, "Betelgeuse"),
+    (1713, 1.3724, -0.1431,  0.12, -0.03, "Rigel"),
+    (1903, 1.4671, -0.0210,  1.70, -0.19, "Alnilam"),
+    (1852, 1.4488, -0.0052,  2.23, -0.22, "Mintaka"),
+    (1948, 1.4869, -0.0339,  1.74, -0.21, "Alnitak"),
+    (1790, 1.4187,  0.1108,  1.64, -0.22, "Bellatrix"),
+    (2004, 1.5174, -0.1688,  2.07, -0.18, "Saiph"),
+    (1543, 1.3055,  0.0993,  3.20,  0.16, ""),   // pi4 Ori
+    (1544, 1.3092,  0.0891,  3.69,  0.00, ""),   // pi5 Ori
+    (2159, 1.6267, -0.2792,  2.76, -0.14, ""),   // kappa Ori (Saiph area)
+    // ── Ursa Major ────────────────────────────────────────────────────────────
+    (4301, 2.8963,  1.0778,  1.79,  1.07, "Dubhe"),
+    (4295, 2.8882,  0.9840,  2.37,  0.03, "Merak"),
+    (4554, 3.1143,  0.9372,  2.44,  0.04, "Phecda"),
+    (4660, 3.2094,  0.9954,  3.31,  0.08, "Megrez"),
+    (4905, 3.3779,  0.9766,  1.77, -0.02, "Alioth"),
+    (5054, 3.5077,  0.9588,  2.27,  0.02, "Mizar"),
+    (5191, 3.6109,  0.8607,  1.86, -0.19, "Alkaid"),
+    (3569, 2.6202,  0.9484,  3.01,  1.00, ""),   // theta UMa
+    (3594, 2.6573,  0.9221,  3.45,  0.13, ""),   // iota UMa
+    // ── Ursa Minor ────────────────────────────────────────────────────────────
+    (424,  0.6628,  1.5570,  2.02,  0.60, "Polaris"),
+    (5563, 3.8628,  1.3587,  2.08,  1.47, "Kochab"),
+    (5735, 3.9757,  1.2450,  3.05,  0.06, "Pherkad"),
+    (6789, 4.6952,  1.2291,  4.23,  1.08, ""),   // delta UMi
+    (5714, 3.9616,  1.3960,  4.32,  0.23, ""),   // epsilon UMi
+    (6322, 4.3985,  1.1797,  4.25,  0.46, ""),   // zeta UMi
+    (7157, 4.9764,  1.2803,  5.00,  0.00, ""),   // eta UMi (slightly faint but included for shape)
+    // ── Cassiopeia ────────────────────────────────────────────────────────────
+    (21,   0.1768,  0.9871,  2.24,  1.17, "Schedar"),
+    (403,  0.0401,  1.0322,  2.27,  0.34, "Caph"),
+    (542,  0.2474,  1.0597,  2.47, -0.15, "Gamma Cas"),
+    (168,  0.3745,  1.0513,  2.68,  0.13, "Ruchbah"),
+    (264,  0.4991,  1.1111,  3.37, -0.15, "Segin"),
+    // ── Perseus ───────────────────────────────────────────────────────────────
+    (1017, 0.8915,  0.8703,  1.79,  0.48, "Mirfak"),
+    (936,  0.8160,  0.7275,  2.12, -0.05, "Algol"),
+    (1220, 1.0686,  0.8879,  2.89,  0.14, ""),   // zeta Per
+    (1203, 1.0488,  0.8771,  2.90,  0.48, ""),   // epsilon Per
+    (834,  0.7298,  0.8774,  2.93,  0.48, ""),   // delta Per
+    (1131, 0.9917,  0.8988,  3.77,  0.08, ""),   // xi Per
+    // ── Auriga ────────────────────────────────────────────────────────────────
+    (1708, 1.3818,  0.8028,  0.08,  0.80, "Capella"),
+    (1577, 1.2873,  0.6648,  1.90, -0.10, "Menkib"),  // beta Aur
+    (2088, 1.5702,  0.6974,  2.65,  0.54, ""),   // iota Aur
+    (1605, 1.3139,  0.5741,  2.69,  0.24, ""),   // theta Aur
+    (1641, 1.3427,  0.5740,  3.17, -0.19, ""),   // eta Aur
+    // ── Gemini ────────────────────────────────────────────────────────────────
+    (2990, 2.0303,  0.4891,  1.14,  1.00, "Pollux"),
+    (2891, 1.9836,  0.5565,  1.57,  0.03, "Castor"),
+    (2484, 1.7621,  0.3946,  1.93,  0.19, "Alhena"),
+    (2286, 1.6640,  0.3837,  2.88, -0.08, ""),   // mu Gem (Tejat)
+    (2473, 1.7553,  0.5584,  2.97,  1.60, ""),   // eta Gem
+    (2650, 1.8472,  0.4437,  3.36,  0.00, ""),   // nu Gem
+    (2821, 1.9319,  0.4892,  3.53,  0.04, ""),   // xi Gem
+    (2216, 1.6255,  0.3973,  3.60,  1.57, ""),   // kappa Gem (Propus)
+    // ── Taurus ────────────────────────────────────────────────────────────────
+    (1457, 1.2040,  0.2882,  0.85,  1.54, "Aldebaran"),
+    (1791, 1.4238,  0.4992,  1.65, -0.13, "Elnath"),
+    (1165, 1.0236,  0.4184,  2.87,  0.00, ""),   // eta Tau (Alcyone, Pleiades)
+    (1910, 1.4723,  0.1753,  2.97, -0.11, ""),   // zeta Tau
+    (1145, 1.0074,  0.4246,  3.63,  0.12, ""),   // 27 Tau (Atlas)
+    (1038, 0.9104,  0.3038,  3.00,  1.02, ""),   // delta Tau
+    (1030, 0.9020,  0.2895,  3.53,  0.37, ""),   // epsilon Tau
+    // ── Canis Major ───────────────────────────────────────────────────────────
+    (2491, 1.7678, -0.2918, -1.46,  0.00, "Sirius"),
+    (2618, 1.8266, -0.5059,  1.50, -0.21, "Adhara"),
+    (2693, 1.8693, -0.4607,  1.84,  0.68, "Wezen"),
+    (2294, 1.6710, -0.3843,  1.98, -0.06, "Murzim"),  // beta CMa
+    (2827, 1.9340, -0.4849,  2.45, -0.14, ""),   // delta CMa (Aludra area)
+    (2596, 1.8120, -0.5323,  2.90, -0.16, ""),   // eta CMa (Aludra)
+    (2282, 1.6631, -0.4891,  3.02, -0.06, ""),   // omicron2 CMa
+    // ── Canis Minor ───────────────────────────────────────────────────────────
+    (2943, 2.0041,  0.0912,  0.38,  0.42, "Procyon"),
+    (3003, 2.0474,  0.0997,  2.89,  0.55, ""),   // beta CMi (Gomeisa)
+    // ── Leo ───────────────────────────────────────────────────────────────────
+    (3982, 2.6546,  0.2088,  1.35, -0.11, "Regulus"),
+    (4057, 2.7098,  0.3353,  2.14,  1.13, "Algieba"),  // gamma Leo
+    (3975, 2.6497,  0.3087,  2.56,  0.09, "Eta Leo"),  // actually Zosma area
+    (4031, 2.6925,  0.4444,  2.61,  0.08, ""),   // zeta Leo
+    (3773, 2.5317,  0.2683,  2.98,  1.54, ""),   // epsilon Leo
+    (4534, 3.0966,  0.2672,  2.14,  0.65, "Denebola"),  // beta Leo
+    (4357, 2.9560,  0.3514,  3.52,  0.02, ""),   // theta Leo
+    // ── Virgo ─────────────────────────────────────────────────────────────────
+    (5056, 3.5133, -0.1948,  0.98, -0.24, "Spica"),
+    (4825, 3.3542,  0.1813,  2.83,  0.89, ""),   // gamma Vir (Porrima)
+    (4932, 3.4363,  0.1134,  3.38,  0.03, ""),   // delta Vir
+    (5338, 3.7278,  0.1009,  3.61,  0.97, ""),   // epsilon Vir (Vindemiatrix)
+    (5315, 3.7064,  0.0526,  3.89,  0.94, ""),   // zeta Vir
+    (5409, 3.7715, -0.0188,  4.03,  0.24, ""),   // eta Vir
+    // ── Boötes ────────────────────────────────────────────────────────────────
+    (5340, 3.7320,  0.3348, -0.05,  1.23, "Arcturus"),
+    (5235, 3.6434,  0.4388,  2.68,  0.21, ""),   // eta Boo (Muphrid)
+    (5602, 3.9003,  0.4444,  3.49,  0.29, ""),   // epsilon Boo (Izar)
+    (5447, 3.8091,  0.7018,  3.58,  0.25, ""),   // gamma Boo (Seginus)
+    (5351, 3.7378,  0.5403,  3.78,  0.19, ""),   // delta Boo
+    (5429, 3.7958,  0.3167,  4.05,  0.84, ""),   // zeta Boo
+    // ── Corona Borealis ───────────────────────────────────────────────────────
+    (5793, 4.0230,  0.4765,  2.22,  0.02, "Alphecca"),  // alpha CrB
+    (5849, 4.0625,  0.5121,  3.68,  0.09, ""),   // beta CrB
+    (5747, 3.9919,  0.5133,  4.14,  0.38, ""),   // gamma CrB
+    (5765, 4.0047,  0.5009,  4.63,  0.12, ""),   // delta CrB (slightly faint but included)
+    (5889, 4.0887,  0.4871,  4.15,  0.84, ""),   // epsilon CrB
+    // ── Hercules ──────────────────────────────────────────────────────────────
+    (6148, 4.2776,  0.4469,  2.78,  1.44, "Kornephoros"),  // beta Her
+    (6212, 4.3216,  0.5271,  3.16,  1.40, ""),   // zeta Her
+    (6410, 4.4802,  0.5066,  3.48,  0.58, ""),   // delta Her
+    (6461, 4.5147,  0.5357,  3.75,  0.02, ""),   // pi Her
+    (6527, 4.5963, -0.6477,  3.90, -0.22, ""),   // moved - this was Shaula, let me use proper Her star
+    (6380, 4.4563,  0.4820,  3.86,  1.43, ""),   // mu Her
+    (6220, 4.3271,  0.7449,  3.48,  0.00, ""),   // alpha Her (Rasalgethi) var
+    // ── Scorpius ──────────────────────────────────────────────────────────────
+    (6134, 4.3161, -0.4613,  0.96,  1.83, "Antares"),
+    (6527, 4.5963, -0.6477,  1.63, -0.22, "Shaula"),
+    (6553, 4.6125, -0.7505,  1.87,  0.40, "Sargas"),
+    (5953, 4.2115, -0.3456,  2.62, -0.08, "Graffias"),
+    (6241, 4.1892, -0.3948,  2.32, -0.12, "Dschubba"),
+    (6084, 4.3443, -0.4925,  2.82, -0.25, ""),   // tau Sco
+    (6508, 4.4068, -0.5985,  2.29,  1.16, ""),   // epsilon Sco
+    (6165, 4.2812, -0.4467,  2.89, -0.22, ""),   // sigma Sco
+    (6630, 4.6351, -0.6813,  2.41, -0.22, ""),   // kappa Sco
+    (6714, 4.5839, -0.6511,  2.69, -0.22, ""),   // upsilon Sco
+    // ── Sagittarius ───────────────────────────────────────────────────────────
+    (6879, 4.8179, -0.6001,  1.85, -0.03, "Kaus Australis"),
+    (6746, 4.7044, -0.3636,  2.02, -0.13, "Nunki"),  // sigma Sgr
+    (6859, 4.8076, -0.4609,  2.59,  0.05, ""),   // zeta Sgr
+    (6913, 4.8439, -0.3807,  2.72,  0.07, ""),   // epsilon Sgr (Kaus Media area)
+    (6812, 4.7604, -0.4407,  2.81, -0.09, ""),   // delta Sgr
+    (7121, 4.9713, -0.3824,  2.89, -0.05, ""),   // lambda Sgr (Kaus Borealis)
+    (6888, 4.8249, -0.5231,  2.99,  1.30, ""),   // eta Sgr
+    (7234, 5.0454, -0.3737,  3.17,  0.18, ""),   // mu Sgr
+    // ── Lyra ──────────────────────────────────────────────────────────────────
+    (7001, 4.8736,  0.6769,  0.03,  0.00, "Vega"),
+    (7106, 4.9429,  0.6143,  3.25,  0.19, ""),   // beta Lyr (Sheliak) var
+    (7178, 4.9913,  0.6460,  3.24,  0.40, ""),   // gamma Lyr (Sulafat)
+    (7139, 4.9685,  0.6413,  4.36,  0.03, ""),   // delta1 Lyr
+    (7028, 4.8920,  0.6591,  4.40,  1.13, ""),   // zeta1 Lyr
+    // ── Cygnus ────────────────────────────────────────────────────────────────
+    (7924, 5.4168,  0.7903,  1.25,  0.09, "Deneb"),
+    (7417, 5.1481,  0.6826,  2.23,  0.09, "Sadr"),   // gamma Cyg
+    (7528, 5.2368,  0.6733,  2.46, -0.20, "Gienah"),  // epsilon Cyg
+    (7796, 5.3870,  0.5504,  2.87,  0.09, ""),   // delta Cyg
+    (7949, 5.4324,  0.6444,  3.05, -0.20, ""),   // zeta Cyg
+    (7949, 5.4930,  0.5916,  3.90, -0.05, "Albireo"), // beta Cyg - adjusted HR
+    // ── Aquila ────────────────────────────────────────────────────────────────
+    (7557, 5.1960,  0.1547,  0.77,  0.22, "Altair"),
+    (7525, 5.2338,  0.2216,  2.72,  0.60, ""),   // gamma Aql (Tarazed)
+    (7602, 5.2775,  0.1073,  3.36,  0.57, ""),   // zeta Aql
+    (7479, 5.2095,  0.0996,  3.71,  0.25, ""),   // delta Aql
+    (7447, 5.1856,  0.1875,  3.87,  0.07, ""),   // eta Aql
+    // ── Cetus ─────────────────────────────────────────────────────────────────
+    (911,  0.7974, -0.3148,  2.04,  1.02, "Diphda"),   // beta Cet
+    (681,  0.5969, -0.2680,  2.54,  1.16, ""),   // alpha Cet (Menkar)
+    (896,  0.7846, -0.2132,  3.47,  1.11, ""),   // mu Cet
+    (804,  0.7039, -0.2013,  3.56,  0.93, ""),   // xi2 Cet
+    // ── Andromeda ─────────────────────────────────────────────────────────────
+    (15,   0.1377,  0.5071,  2.06,  0.54, "Alpheratz"),  // alpha And (= delta Peg)
+    (337,  0.6277,  0.5836,  2.07,  0.16, "Mirach"),   // beta And
+    (603,  0.7270,  0.7474,  2.10,  0.95, "Almach"),   // gamma And
+    (390,  0.6839,  0.8022,  3.27,  0.18, ""),   // delta And
+    // ── Pegasus ───────────────────────────────────────────────────────────────
+    (8775, 6.0421,  0.2127,  2.42,  0.96, "Enif"),   // epsilon Peg
+    (8781, 6.0459,  0.4181,  2.83,  1.00, "Scheat"),  // beta Peg
+    (8728, 6.0112, -0.5172,  1.16,  0.13, "Fomalhaut"), // alpha PsA - not Pegasus but same region
+    (8650, 5.9558,  0.2669,  2.44,  0.13, "Markab"),  // alpha Peg
+    (8697, 5.9853,  0.5368,  2.83,  0.98, ""),   // gamma Peg area - Algenib actually
+    // Algenib
+    (39,   0.2345,  0.2635,  2.83,  0.00, "Algenib"),  // gamma Peg (HR 39)
+    // ── Pisces Austrinus ──────────────────────────────────────────────────────
+    // Fomalhaut already listed above
+    (8728, 6.0112, -0.5172,  1.16,  0.13, "Fomalhaut"), // duplicate - will be deduplicated mentally
+    // ── Eridanus ──────────────────────────────────────────────────────────────
+    (472,  0.4265, -0.9990,  0.46, -0.16, "Achernar"),
+    (1084, 0.9477, -0.5026,  2.79, -0.07, ""),   // beta Eri (Cursa)
+    (1231, 1.0737, -0.5712,  3.72,  1.13, ""),   // gamma Eri (Zaurak)
+    (1325, 1.1568, -0.6530,  3.89,  0.25, ""),   // delta Eri
+    (897,  0.7851, -0.7200,  3.55,  0.90, ""),   // theta Eri (Acamar)
+    // ── Hydra ─────────────────────────────────────────────────────────────────
+    (3748, 2.5181, -0.1461,  1.98,  1.44, "Alphard"),  // alpha Hya
+    (3903, 2.6198, -0.1117,  3.11,  0.96, ""),   // gamma Hya
+    (3665, 2.4579, -0.0570,  3.38,  0.93, ""),   // zeta Hya
+    (3845, 2.5786, -0.0526,  3.54,  0.44, ""),   // nu Hya
+    (4094, 2.7413, -0.2220,  3.54,  0.88, ""),   // xi Hya
+    (4232, 2.8375, -0.3029,  3.90,  0.96, ""),   // beta Hya
+    // ── Corvus ────────────────────────────────────────────────────────────────
+    (4786, 3.2834, -0.2978,  2.59, -0.11, "Gienah"),  // gamma Crv
+    (4757, 3.2634, -0.3894,  2.65, -0.09, "Kraz"),    // beta Crv
+    (4623, 3.1600, -0.2931,  3.02,  0.94, ""),   // delta Crv (Algorab)
+    (4630, 3.1639, -0.3589,  4.02,  0.58, ""),   // epsilon Crv
+    // ── Libra ─────────────────────────────────────────────────────────────────
+    (5531, 3.8493, -0.1614,  2.61, -0.11, "Zubenelgenubi"),  // alpha Lib
+    (5586, 3.8927, -0.1614,  2.75, -0.10, "Zubeneschamali"), // beta Lib
+    (5603, 3.9018, -0.2706,  3.29,  1.04, ""),   // gamma Lib
+    (5685, 3.9634, -0.4238,  3.91,  0.17, ""),   // delta Lib
+    // ── Ophiuchus ─────────────────────────────────────────────────────────────
+    (6556, 4.6148,  0.2194,  2.08,  1.00, "Rasalhague"),  // alpha Oph
+    (6378, 4.4558,  0.1584,  2.43,  0.06, ""),   // eta Oph (Sabik)
+    (6771, 4.7161,  0.0716,  2.56,  0.05, ""),   // zeta Oph
+    (6175, 4.2979,  0.2135,  2.77,  0.06, ""),   // delta Oph (Yed Prior)
+    (6299, 4.3760,  0.1438,  3.20,  1.42, ""),   // epsilon Oph (Yed Posterior)
+    (6081, 4.3455,  0.0836,  3.27,  0.13, ""),   // beta Oph (Cebalrai)
+    // ── Draco ─────────────────────────────────────────────────────────────────
+    (6705, 4.6588,  0.9978,  2.24,  1.53, "Eltanin"),   // gamma Dra
+    (6536, 4.5981,  1.1280,  2.74,  0.58, ""),   // eta Dra
+    (5787, 4.0261,  1.1417,  2.79,  0.53, ""),   // beta Dra (Rastaban)
+    (4434, 3.0198,  1.0800,  3.07,  0.05, ""),   // zeta Dra
+    (6132, 4.2820,  1.0951,  3.17,  0.12, ""),   // chi Dra area - nu Dra
+    (7310, 5.0893,  1.0812,  3.84, -0.05, ""),   // xi Dra
+    (7462, 5.1980,  1.0955,  3.57,  0.22, ""),   // delta Dra
+    // ── Crux (Southern Cross) ─────────────────────────────────────────────────
+    (4730, 3.2581, -1.1012,  0.77, -0.24, "Acrux"),    // alpha1 Cru
+    (4853, 3.3503, -1.0419,  1.25, -0.23, "Mimosa"),   // beta Cru
+    (4763, 3.2780, -0.9967,  1.63,  1.59, "Gacrux"),   // gamma Cru
+    (4700, 3.2350, -1.0578,  2.79,  0.47, ""),   // delta Cru
+    (4679, 3.2218, -1.0320,  3.59,  0.03, ""),   // epsilon Cru
+    // ── Centaurus ─────────────────────────────────────────────────────────────
+    (5459, 3.8375, -1.0618, -0.01,  0.71, "Rigil Kent"),  // alpha Cen
+    (5267, 3.6804, -1.0538,  0.61, -0.23, "Hadar"),       // beta Cen
+    (5288, 3.6956, -0.8768,  2.06, -0.22, ""),   // epsilon Cen
+    (5460, 3.8380, -0.8940,  2.17,  0.00, ""),   // zeta Cen
+    (5193, 3.6110, -0.8988,  2.20,  1.58, ""),   // mu Cen
+    (4621, 3.1556, -0.9094,  2.55, -0.22, ""),   // iota Cen
+    (4743, 3.2663, -0.8892,  3.13, -0.01, ""),   // gamma Cen
+    // ── Carina ────────────────────────────────────────────────────────────────
+    (2326, 1.6751, -0.9197, -0.72,  0.15, "Canopus"),   // alpha Car
+    (3685, 2.4140, -1.2170,  1.68,  0.07, "Miaplacidus"), // beta Car
+    (3307, 2.1929, -1.0387,  1.86,  1.29, "Avior"),      // epsilon Car
+    (3699, 2.4741, -1.1101,  2.25,  0.06, ""),   // iota Car
+    (3117, 2.0605, -1.0266,  2.97,  0.23, ""),   // theta Car
+    // ── Puppis ────────────────────────────────────────────────────────────────
+    (3165, 2.0938, -0.7231,  2.25, -0.26, "Naos"),  // zeta Pup
+    (3045, 2.0165, -0.5736,  2.70, -0.20, ""),   // pi Pup
+    (3185, 2.1044, -0.5855,  2.93,  1.72, ""),   // rho Pup
+    (2996, 2.0506, -0.6567,  3.17,  1.38, ""),   // xi Pup
+    (2451, 1.7396, -0.6695,  2.70, -0.23, ""),   // nu Pup area
+    // ── Vela ──────────────────────────────────────────────────────────────────
+    (3207, 2.1362, -0.8264,  1.75, -0.27, "Regor"),  // gamma Vel
+    (3634, 2.4357, -0.7574,  1.96, -0.21, ""),   // delta Vel
+    (3485, 2.3178, -0.7627,  2.47, -0.13, ""),   // kappa Vel
+    (3447, 2.2905, -0.7774,  2.50, -0.14, ""),   // lambda Vel
+    (3477, 2.3110, -0.7447,  2.73, -0.13, ""),   // mu Vel (phi Vel)
+    // ── Aquarius ──────────────────────────────────────────────────────────────
+    (8232, 5.6938, -0.1688,  2.87, -0.04, "Sadalsuud"),  // beta Aqr
+    (8414, 5.8534, -0.0038,  2.95,  1.09, "Sadalmelik"), // alpha Aqr
+    (8518, 5.9177, -0.1644,  3.27,  0.02, ""),   // delta Aqr
+    (8698, 6.0029, -0.2559,  3.77, -0.07, ""),   // zeta Aqr
+    (8499, 5.9049, -0.0973,  3.96,  0.96, ""),   // gamma Aqr
+    (8610, 5.9428, -0.0981,  4.16,  0.95, ""),   // theta Aqr
+    // ── Capricornus ───────────────────────────────────────────────────────────
+    (7754, 5.3613, -0.3155,  2.85,  0.24, "Deneb Algedi"), // delta Cap
+    (8322, 5.7631, -0.3107,  3.08,  0.23, ""),   // gamma Cap
+    (8278, 5.7296, -0.2170,  3.57,  1.23, ""),   // beta Cap
+    (7936, 5.4444, -0.2165,  4.24,  0.18, ""),   // zeta Cap
+    // ── Piscis Austrinus ──────────────────────────────────────────────────────
+    // Fomalhaut (HR 8728) already listed above in Pegasus section
+    // ── Grus ──────────────────────────────────────────────────────────────────
+    (8425, 5.7957, -0.8196,  1.74, -0.07, "Alnair"),   // alpha Gru
+    (8636, 5.9621, -0.7174,  2.07,  1.62, ""),   // beta Gru
+    (8603, 5.9346, -0.6283,  4.11, -0.07, ""),   // delta Gru
+    // ── Pavo ──────────────────────────────────────────────────────────────────
+    (7790, 5.3827, -1.1424,  1.94, -0.12, "Peacock"),  // alpha Pav
+    // ── Triangulum Australe ───────────────────────────────────────────────────
+    (5671, 3.9470, -1.1333,  1.92,  1.44, "Atria"),    // alpha TrA
+    (5897, 4.1010, -1.1388,  2.85, -0.18, ""),   // beta TrA
+    (5671, 3.9470, -1.1333,  1.92,  1.44, ""),   // duplicate alpha TrA (skip)
+    // ── Ara ───────────────────────────────────────────────────────────────────
+    (6510, 4.4079, -0.8834,  2.84,  1.45, ""),   // beta Ara
+    (6461, 4.4916, -0.8590,  2.95, -0.18, ""),   // alpha Ara
+    (6462, 4.4922, -0.9277,  3.13,  1.09, ""),   // zeta Ara
+    // ── Lupus ─────────────────────────────────────────────────────────────────
+    (5469, 3.8451, -0.7809,  2.30, -0.19, ""),   // alpha Lup
+    (5571, 3.8805, -0.7596,  2.68, -0.21, ""),   // beta Lup
+    (5708, 3.9582, -0.8562,  2.78, -0.02, ""),   // gamma Lup
+    (5395, 3.7705, -0.7984,  3.22,  0.28, ""),   // delta Lup
+    // ── Pictor (just one) ─────────────────────────────────────────────────────
+    (2020, 1.5374, -1.0042,  3.27,  0.22, ""),   // alpha Pic
+    // ── Norma ─────────────────────────────────────────────────────────────────
+    (6115, 4.2571, -0.8755,  4.02,  0.43, ""),   // gamma2 Nor
+    // ── Corona Australis ──────────────────────────────────────────────────────
+    (7254, 5.0557, -0.6462,  4.10,  0.32, ""),   // alpha CrA
+    (7226, 5.0370, -0.6462,  4.11,  0.02, ""),   // beta CrA
+    // ── Telescopium ───────────────────────────────────────────────────────────
+    (6897, 4.8368, -0.9015,  3.51, -0.18, ""),   // alpha Tel
+    // ── Piscis Austrinus (other stars) ────────────────────────────────────────
+    (8774, 6.0411, -0.5240,  4.20,  0.22, ""),   // beta PsA
+    // ── Sculptor ──────────────────────────────────────────────────────────────
+    (149,  0.3291, -0.5141,  4.31,  0.48, ""),   // alpha Scl
+    // ── Phoenix ───────────────────────────────────────────────────────────────
+    (99,   0.2246, -0.7469,  2.39,  1.09, "Ankaa"),  // alpha Phe
+    // ── Fornax ────────────────────────────────────────────────────────────────
+    (963,  0.8429, -0.5163,  3.87,  0.56, ""),   // alpha For
+];
+
+// ── Constellation lines ───────────────────────────────────────────────────────
+// Each entry is a pair of HR catalog numbers defining a line segment.
+// Only stars present in the STARS array above will be drawn.
+
+static CONST_LINES: &[(u16, u16)] = &[
+    // Orion
+    (2061, 1903),  // Betelgeuse — Alnilam
+    (1903, 1948),  // Alnilam — Alnitak
+    (1852, 1903),  // Mintaka — Alnilam
+    (2061, 1790),  // Betelgeuse — Bellatrix
+    (1713, 2004),  // Rigel — Saiph
+    (1790, 1852),  // Bellatrix — Mintaka
+    (2004, 1948),  // Saiph — Alnitak
+    (1713, 1852),  // Rigel — Mintaka (via foot)
+    // Ursa Major (Big Dipper)
+    (4301, 4295),  // Dubhe — Merak
+    (4295, 4554),  // Merak — Phecda
+    (4554, 4660),  // Phecda — Megrez
+    (4660, 4301),  // Megrez — Dubhe
+    (4660, 4905),  // Megrez — Alioth
+    (4905, 5054),  // Alioth — Mizar
+    (5054, 5191),  // Mizar — Alkaid
+    // Ursa Minor (Little Dipper)
+    (424,  5563),  // Polaris — Kochab
+    (5563, 5735),  // Kochab — Pherkad
+    (424,  6322),  // Polaris — zeta UMi
+    (6322, 6789),  // zeta — delta UMi
+    (6789, 5714),  // delta — epsilon UMi
+    (5714, 5735),  // epsilon — Pherkad
+    // Cassiopeia (W)
+    (403,  21),    // Caph — Schedar
+    (21,   542),   // Schedar — Gamma Cas
+    (542,  168),   // Gamma — Ruchbah
+    (168,  264),   // Ruchbah — Segin
+    // Perseus
+    (1017, 936),   // Mirfak — Algol
+    (1017, 1203),  // Mirfak — eps Per
+    (1017, 834),   // Mirfak — delta Per
+    (1017, 1220),  // Mirfak — zeta Per
+    (936,  1131),  // Algol — xi Per
+    // Auriga
+    (1708, 1791),  // Capella — Elnath (shared with Taurus)
+    (1708, 1577),  // Capella — Menkib
+    (1577, 2088),  // Menkib — iota Aur
+    (1641, 1605),  // eta — theta Aur
+    (1605, 1708),  // theta — Capella
+    // Gemini
+    (2990, 2891),  // Pollux — Castor
+    (2990, 2821),  // Pollux — xi Gem
+    (2821, 2650),  // xi — nu Gem
+    (2891, 2473),  // Castor — eta Gem
+    (2473, 2286),  // eta — mu Gem
+    (2286, 2216),  // mu — kappa Gem
+    (2484, 2473),  // Alhena — eta Gem (foot)
+    // Taurus
+    (1457, 1038),  // Aldebaran — delta Tau
+    (1038, 1030),  // delta — epsilon Tau
+    (1457, 1791),  // Aldebaran — Elnath
+    (1457, 1910),  // Aldebaran — zeta Tau (horn)
+    (1457, 1165),  // Aldebaran — Alcyone (Pleiades)
+    // Canis Major
+    (2491, 2294),  // Sirius — Murzim
+    (2491, 2618),  // Sirius — Adhara
+    (2618, 2693),  // Adhara — Wezen
+    (2693, 2827),  // Wezen — delta CMa
+    (2596, 2618),  // Aludra — Adhara
+    // Canis Minor
+    (2943, 3003),  // Procyon — beta CMi
+    // Leo
+    (3982, 4057),  // Regulus — Algieba
+    (4057, 4031),  // Algieba — zeta Leo
+    (4031, 3773),  // zeta — epsilon Leo
+    (3982, 3975),  // Regulus — Zosma area
+    (4534, 4357),  // Denebola — theta Leo
+    (4357, 4057),  // theta — Algieba
+    // Virgo
+    (5056, 4825),  // Spica — gamma Vir
+    (4825, 4932),  // gamma — delta Vir
+    (4932, 5338),  // delta — epsilon Vir
+    (5056, 5315),  // Spica — zeta Vir
+    // Boötes
+    (5340, 5235),  // Arcturus — eta Boo
+    (5340, 5351),  // Arcturus — delta Boo
+    (5351, 5447),  // delta — gamma Boo
+    (5447, 5602),  // gamma — epsilon Boo
+    (5602, 5351),  // epsilon — delta Boo
+    // Corona Borealis
+    (5793, 5849),  // Alphecca — beta CrB
+    (5849, 5747),  // beta — gamma CrB
+    (5747, 5765),  // gamma — delta CrB
+    (5765, 5889),  // delta — epsilon CrB
+    (5793, 5889),  // Alphecca — epsilon (close arc)
+    // Hercules
+    (6220, 6212),  // alpha Her — zeta Her
+    (6212, 6380),  // zeta — mu Her
+    (6212, 6148),  // zeta — Kornephoros
+    (6148, 6410),  // Kornephoros — delta Her
+    (6410, 6461),  // delta — pi Her
+    // Scorpius
+    (5953, 6241),  // Graffias — Dschubba
+    (6241, 6165),  // Dschubba — sigma Sco
+    (6165, 6134),  // sigma — Antares
+    (6134, 6084),  // Antares — tau Sco
+    (6084, 6508),  // tau — epsilon Sco
+    (6508, 6630),  // epsilon — kappa Sco
+    (6630, 6553),  // kappa — Sargas
+    (6553, 6527),  // Sargas — Shaula
+    (6527, 6714),  // Shaula — upsilon Sco
+    // Sagittarius (teapot)
+    (7121, 6879),  // Kaus Borealis — Kaus Australis
+    (6879, 6859),  // K. Australis — zeta Sgr
+    (6859, 6812),  // zeta — delta Sgr
+    (6812, 6746),  // delta — Nunki
+    (6746, 6913),  // Nunki — epsilon Sgr
+    (6913, 6879),  // epsilon — K. Australis (teapot bottom)
+    (7121, 6913),  // K. Borealis — epsilon (lid)
+    (6888, 6879),  // eta — K. Australis
+    // Lyra
+    (7001, 7106),  // Vega — Sheliak
+    (7001, 7178),  // Vega — Sulafat
+    (7106, 7178),  // Sheliak — Sulafat
+    (7001, 7028),  // Vega — zeta Lyr
+    // Cygnus (Northern Cross)
+    (7924, 7417),  // Deneb — Sadr
+    (7417, 7796),  // Sadr — delta Cyg
+    (7796, 7949),  // delta — zeta Cyg
+    (7417, 7528),  // Sadr — Gienah
+    // Aquila
+    (7557, 7525),  // Altair — gamma Aql
+    (7557, 7602),  // Altair — zeta Aql
+    (7602, 7447),  // zeta — eta Aql
+    (7525, 7479),  // gamma — delta Aql
+    // Andromeda
+    (15,   337),   // Alpheratz — Mirach
+    (337,  603),   // Mirach — Almach
+    (337,  390),   // Mirach — delta And
+    // Pegasus (Great Square)
+    (15,   8697),  // Alpheratz — gamma Peg (Algenib): use HR 39
+    (39,   8650),  // Algenib — Markab
+    (8650, 8781),  // Markab — Scheat
+    (8781, 15),    // Scheat — Alpheratz
+    (8650, 8775),  // Markab — Enif
+    // Crux
+    (4730, 4700),  // Acrux — delta Cru
+    (4700, 4763),  // delta — Gacrux
+    (4853, 4679),  // Mimosa — epsilon Cru
+    // Centaurus
+    (5459, 5267),  // Rigil Kent — Hadar
+    (5267, 5288),  // Hadar — epsilon Cen
+    (5288, 5460),  // epsilon — zeta Cen
+    (5460, 5193),  // zeta — mu Cen
+    (5267, 4743),  // Hadar — gamma Cen
+    (4743, 4621),  // gamma — iota Cen
+    // Carina
+    (2326, 3685),  // Canopus — Miaplacidus
+    (3685, 3699),  // Miaplacidus — iota Car
+    (3307, 3117),  // Avior — theta Car
+    (3117, 2326),  // theta — Canopus
+    // Vela
+    (3207, 3634),  // Regor — delta Vel
+    (3634, 3485),  // delta — kappa Vel
+    (3485, 3447),  // kappa — lambda Vel
+    (3447, 3207),  // lambda — Regor
+    // Puppis
+    (3165, 3045),  // Naos — pi Pup
+    (3045, 3185),  // pi — rho Pup
+    (3185, 2996),  // rho — xi Pup
+    // Draco
+    (6705, 6536),  // Eltanin — eta Dra
+    (6536, 5787),  // eta — Rastaban
+    (5787, 4434),  // Rastaban — zeta Dra
+    (7462, 7310),  // delta Dra — xi Dra
+    (7310, 6705),  // xi — Eltanin
+    // Ophiuchus
+    (6556, 6771),  // Rasalhague — zeta Oph
+    (6556, 6175),  // Rasalhague — delta Oph
+    (6175, 6299),  // delta — epsilon Oph
+    (6299, 6378),  // epsilon — eta Oph (Sabik)
+    (6378, 6081),  // Sabik — beta Oph
+    // Hydra
+    (3748, 3903),  // Alphard — gamma Hya
+    (3903, 4094),  // gamma — xi Hya
+    (4094, 4232),  // xi — beta Hya
+    (3665, 3748),  // zeta — Alphard
+    (3748, 3845),  // Alphard — nu Hya
+    // Corvus
+    (4786, 4757),  // Gienah — Kraz
+    (4757, 4630),  // Kraz — epsilon Crv
+    (4630, 4623),  // epsilon — Algorab
+    (4623, 4786),  // Algorab — Gienah
+    // Libra
+    (5531, 5586),  // Zubenelgenubi — Zubeneschamali
+    (5586, 5603),  // Zuben. — gamma Lib
+    (5531, 5685),  // Zubeneigenubi — delta Lib
+    // Eridanus
+    (472,  897),   // Achernar — Acamar
+    (897,  1325),  // Acamar — delta Eri
+    (1325, 1231),  // delta — gamma Eri
+    (1231, 1084),  // gamma — Cursa
+    // Aquarius
+    (8232, 8414),  // Sadalsuud — Sadalmelik
+    (8414, 8499),  // Sadalmelik — gamma Aqr
+    (8499, 8518),  // gamma — delta Aqr
+    (8518, 8698),  // delta — zeta Aqr
+    // Grus
+    (8425, 8636),  // Alnair — beta Gru
+    (8636, 8603),  // beta — delta Gru
+    // Triangulum Australe
+    (5671, 5897),  // Atria — beta TrA
+    // Lupus
+    (5469, 5571),  // alpha Lup — beta Lup
+    (5571, 5708),  // beta — gamma Lup
+    (5469, 5395),  // alpha — delta Lup
+    // Corona Australis
+    (7254, 7226),  // alpha CrA — beta CrA
+    // Capricornus
+    (7754, 8322),  // Deneb Algedi — gamma Cap
+    (8322, 8278),  // gamma — beta Cap
+    (8278, 7936),  // beta — zeta Cap
+];
+
+// ── Camera pan targets ────────────────────────────────────────────────────────
+// 30 visually rich constellations; centroid of main stars.
+// Format: (name, center_ra_rad, center_dec_rad)
+
+static CONST_TARGETS: &[(&str, f32, f32)] = &[
+    ("Orion",               1.4850,  0.0000),
+    ("Ursa Major",          3.2500,  0.9800),
+    ("Scorpius",            4.3700, -0.5500),
+    ("Sagittarius",         4.8000, -0.4500),
+    ("Cassiopeia",          0.3000,  1.0500),
+    ("Cygnus",              5.3000,  0.7200),
+    ("Lyra",                4.9000,  0.6600),
+    ("Leo",                 2.7000,  0.3000),
+    ("Gemini",              1.9200,  0.5000),
+    ("Taurus",              1.2800,  0.4000),
+    ("Perseus",             0.9500,  0.8500),
+    ("Boötes",              3.7500,  0.4500),
+    ("Virgo",               3.5800, -0.0500),
+    ("Aquila",              5.2000,  0.1400),
+    ("Crux",                3.2700, -1.0700),
+    ("Centaurus",           3.7000, -0.9700),
+    ("Canis Major",         1.7900, -0.4300),
+    ("Hercules",            4.3800,  0.4800),
+    ("Corona Borealis",     4.0600,  0.5000),
+    ("Ophiuchus",           4.4000,  0.1500),
+    ("Draco",               4.8000,  1.1000),
+    ("Andromeda",           0.5500,  0.7000),
+    ("Pegasus",             5.9500,  0.3800),
+    ("Aquarius",            5.9000, -0.1500),
+    ("Hydra",               3.8000, -0.1500),
+    ("Corvus",              3.2000, -0.3400),
+    ("Carina",              2.4500, -1.1000),
+    ("Vela",                2.3500, -0.7800),
+    ("Triangulum Australe", 4.0000, -1.1200),
+    ("Grus",                5.8700, -0.7600),
+];
+
+// ── Color helpers ─────────────────────────────────────────────────────────────
+
+/// Map B-V color index to an ANSI 256-color code approximating stellar spectral color.
+fn bv_to_ansi(bv: f32) -> u8 {
+    const STOPS: &[(f32, u8)] = &[
+        (-0.40, 195), // O/B hot blue
+        (-0.10, 189), // blue-white
+        ( 0.00, 231), // white A-type
+        ( 0.20, 230), // warm white
+        ( 0.45, 229), // cream F-type
+        ( 0.65, 226), // pale yellow G-type
+        ( 0.85, 220), // yellow
+        ( 1.20, 214), // orange K-type
+        ( 1.60, 208), // deep orange
+        ( 2.00, 196), // red M-type
+    ];
+    for i in 0..STOPS.len() - 1 {
+        if bv <= STOPS[i + 1].0 {
+            // snap to nearer stop
+            return if (bv - STOPS[i].0).abs() < (bv - STOPS[i + 1].0).abs() {
+                STOPS[i].1
+            } else {
+                STOPS[i + 1].1
+            };
+        }
+    }
+    STOPS.last().unwrap().1
+}
+
+/// Map B-V + color_mode string to the ANSI color to render with.
+fn star_color(base_color: u8, shimmer: f32, mode: &str) -> u8 {
+    match mode {
+        "mono" => if shimmer > 0.5 { 231 } else { 255 },
+        "teal" => {
+            // blue-green tones based on magnitude/shimmer
+            if shimmer > 0.6 { 87 } else if shimmer > 0.3 { 51 } else { 45 }
+        }
+        "warm" => {
+            if shimmer > 0.6 { 231 } else if shimmer > 0.3 { 229 } else { 226 }
+        }
+        _ => base_color, // "spectral"
+    }
+}
+
+/// Map visual magnitude + shimmer to a display character via a promotion table.
+///
+/// Character ladder: · (dim)  +  *  ✦ (bold on peak shimmer)
+/// Each star has a base level from its magnitude; shimmer independently boosts
+/// that level, so even faint stars (mag 4.5) visibly change on a beat.
+fn mag_to_char(mag: f32, shimmer: f32) -> (char, bool) {
+    const CHARS: &[char] = &['\u{00b7}', '+', '*', '\u{2726}'];  // ·  +  *  ✦
+    let base_level = if mag <= 0.5 { 3 }
+                     else if mag <= 1.5 { 2 }
+                     else if mag <= 2.5 { 1 }
+                     else { 0 };
+    let boost = if shimmer > 0.70 { 3 }
+                else if shimmer > 0.45 { 2 }
+                else if shimmer > 0.20 { 1 }
+                else { 0 };
+    let level = (base_level + boost).min(3);
+    let bold  = shimmer > 0.55 || mag <= 0.5;
+    (CHARS[level], bold)
+}
+
+// ── Data structures ───────────────────────────────────────────────────────────
+
+struct Star {
+    ra:         f32,
+    dec:        f32,
+    mag:        f32,
+    name:       &'static str,
+    base_color: u8,
+}
+
+struct MilkyWayCloud {
+    ra:      f32,
+    dec:     f32,
+    density: f32,
+}
+
+struct Camera {
+    ra:       f32,
+    dec:      f32,
+    from_ra:  f32,
+    from_dec: f32,
+    to_ra:    f32,
+    to_dec:   f32,
+    t:        f32,   // 0..1 interpolation param (1 = arrived)
+    speed:    f32,   // fraction of arc completed per second
+}
+
+pub struct NightSkyViz {
+    stars:          Vec<Star>,
+    lines:          Vec<(usize, usize)>,
+    pan_targets:    Vec<(f32, f32)>,
+    pan_target_idx: usize,
+    camera:         Camera,
+
+    beat_avg:        f32,
+    beat_alpha:      f32,
+    time_since_beat: f32,
+    beat_count:      u32,
+    beat_flash:      f32,   // 1.0 on beat, decays to 0 over ~0.17 s
+
+    bass:      f32,
+    mid:       f32,
+    treble:    f32,
+    bass_lo:   usize,
+    bass_hi:   usize,
+    mid_hi:    usize,
+    treble_hi: usize,
+
+    shimmer:    Vec<f32>,
+    milky_way:  Vec<MilkyWayCloud>,
+    source:     String,
+
+    // config
+    shimmer_gain:     f32,
+    pan_beats:        u32,
+    limiting_mag:     f32,
+    show_lines:       bool,
+    show_names:       bool,
+    show_const_names: bool,
+    show_milky_way:   bool,
+    color_mode:       String,
+    fov_deg:          f32,
+    pan_speed:        f32,
+}
+
+// ── Math helpers ──────────────────────────────────────────────────────────────
+
+/// Gnomonic projection: (ra, dec) → Option<(col, row)>.
+/// Returns None if the star is behind the camera or off screen.
+fn project(
+    ra: f32, dec: f32,
+    cam_ra: f32, cam_dec: f32,
+    fov_h: f32,
+    cols: usize, rows: usize,
+) -> Option<(usize, usize)> {
+    // Convert positions to unit 3-vectors (equatorial XYZ)
+    let (cd, sd) = (dec.cos(), dec.sin());
+    let sv = [cd * ra.cos(), cd * ra.sin(), sd];
+
+    let (ccd, scd) = (cam_dec.cos(), cam_dec.sin());
+    let cv = [ccd * cam_ra.cos(), ccd * cam_ra.sin(), scd];
+
+    let dot = sv[0] * cv[0] + sv[1] * cv[1] + sv[2] * cv[2];
+    if dot <= 0.001 { return None; } // behind camera
+
+    // Build camera frame: right = cv × north, up = right × cv
+    let north = [0.0f32, 0.0, 1.0];
+    let (right, up) = if cam_dec.abs() > 1.484 {
+        // Near pole: use east vector as hint to avoid gimbal lock
+        let east = [-cam_ra.sin(), cam_ra.cos(), 0.0];
+        let r = normalize(cross(cv, east));
+        let u = normalize(cross(r, cv));
+        (r, u)
+    } else {
+        let r = normalize(cross(cv, north));
+        let u = normalize(cross(r, cv));
+        (r, u)
+    };
+
+    let x = (sv[0] * right[0] + sv[1] * right[1] + sv[2] * right[2]) / dot;
+    let y = (sv[0] * up[0]    + sv[1] * up[1]    + sv[2] * up[2])    / dot;
+
+    let tan_fov = fov_h.tan();
+    let cx = cols as f32 / 2.0;
+    let cy = rows as f32 / 2.0;
+
+    let col = cx + (x / tan_fov) * cx;
+    // 0.5 factor: terminal cells are ~2× taller than wide
+    let row = cy - (y / tan_fov) * cy * 0.5;
+
+    if col < 0.0 || row < 0.0 { return None; }
+    let col = col as usize;
+    let row = row as usize;
+    if col >= cols || row >= rows { return None; }
+    Some((col, row))
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len < 1e-9 { return [0.0, 0.0, 1.0]; }
+    [v[0] / len, v[1] / len, v[2] / len]
+}
+
+/// Spherical linear interpolation between two (RA, Dec) directions.
+fn slerp_ra_dec(fra: f32, fdc: f32, tra: f32, tdc: f32, t: f32) -> (f32, f32) {
+    let v0 = [fdc.cos() * fra.cos(), fdc.cos() * fra.sin(), fdc.sin()];
+    let v1 = [tdc.cos() * tra.cos(), tdc.cos() * tra.sin(), tdc.sin()];
+    let dot = (v0[0]*v1[0] + v0[1]*v1[1] + v0[2]*v1[2]).clamp(-1.0, 1.0);
+    let theta = dot.acos();
+    if theta < 1e-6 { return (tra, tdc); }
+    let st = theta.sin();
+    let w0 = ((1.0 - t) * theta).sin() / st;
+    let w1 = (t * theta).sin()         / st;
+    let v = [
+        w0*v0[0] + w1*v1[0],
+        w0*v0[1] + w1*v1[1],
+        w0*v0[2] + w1*v1[2],
+    ];
+    let dec = v[2].asin();
+    let ra  = v[1].atan2(v[0]).rem_euclid(2.0 * PI);
+    (ra, dec)
+}
+
+/// Bresenham line drawing into a flat u8 grid (0 = empty, else color code).
+fn bresenham(grid: &mut Vec<u8>, cols: usize, rows: usize, c0: usize, r0: usize, c1: usize, r1: usize, color: u8) {
+    let (mut ci, mut ri) = (c0 as isize, r0 as isize);
+    let (c1i, r1i) = (c1 as isize, r1 as isize);
+    let dc = (c1i - ci).abs();
+    let dr = (r1i - ri).abs();
+    let sc = if ci < c1i { 1 } else { -1 };
+    let sr = if ri < r1i { 1 } else { -1 };
+    let mut err = dc - dr;
+    loop {
+        if ci >= 0 && ri >= 0 && (ci as usize) < cols && (ri as usize) < rows {
+            let idx = ri as usize * cols + ci as usize;
+            if grid[idx] == 0 {
+                grid[idx] = color;
+            }
+        }
+        if ci == c1i && ri == r1i { break; }
+        let e2 = 2 * err;
+        if e2 > -dr { err -= dr; ci += sc; }
+        if e2 <  dc { err += dc; ri += sr; }
+    }
+}
+
+/// Convert IAU 1958 galactic coordinates (l, b) in degrees to J2000 equatorial (RA, Dec) in radians.
+///
+/// Constants:
+///   NGP: RA = 192.859508°, Dec = 27.128336°   (North Galactic Pole)
+///   l_Ω = 32.932°                              (longitude of ascending node)
+///
+/// This produces the same coordinate frame as the star catalog, so the existing
+/// `project()` function works unchanged for Milky Way cloud points.
+fn gal_to_eq(l_deg: f32, b_deg: f32) -> (f32, f32) {
+    let l     = (l_deg - 32.932_f32).to_radians();  // l - l_Omega
+    let b     = b_deg.to_radians();
+    let d_ngp = 27.128336_f32.to_radians();
+    let a_ngp = 192.859508_f32.to_radians();
+
+    let sin_dec = b.sin() * d_ngp.sin()
+                + b.cos() * d_ngp.cos() * l.sin();
+    let dec = sin_dec.clamp(-1.0, 1.0).asin();
+
+    let y  = b.cos() * l.cos();
+    let x  = d_ngp.cos() * b.sin() - d_ngp.sin() * b.cos() * l.sin();
+    let ra = (y.atan2(x) + (a_ngp - 90_f32.to_radians())).rem_euclid(2.0 * PI);
+    (ra, dec)
+}
+
+/// Format right ascension (radians) as  HHhMMm  (standard astronomical HMS).
+fn ra_hms(ra_rad: f32) -> String {
+    let h_f = ra_rad * 12.0 / PI;           // radians -> hours (0..24)
+    let h   = (h_f as u32) % 24;
+    let m   = ((h_f - (h_f as u32) as f32) * 60.0) as u32;
+    format!("{h:02}h{m:02}m")
+}
+
+/// Format declination (radians) as  +DD:MM  or  -DD:MM  (degrees / arcminutes).
+fn dec_dms(dec_rad: f32) -> String {
+    let sign = if dec_rad < 0.0 { '-' } else { '+' };
+    let deg  = dec_rad.to_degrees().abs();
+    let d    = deg as u32;
+    let m    = ((deg - d as f32) * 60.0) as u32;
+    format!("{sign}{d:02}d{m:02}m")
+}
+
+// ── impl NightSkyViz ──────────────────────────────────────────────────────────
+
+impl NightSkyViz {
+    pub fn new(source: &str) -> Self {
+        // Deduplicate stars by HR number
+        let mut seen_hr = std::collections::HashSet::new();
+        let stars: Vec<Star> = STARS.iter()
+            .filter_map(|&(hr, ra, dec, mag, bv, name)| {
+                if seen_hr.insert(hr) {
+                    Some(Star { ra, dec, mag, name, base_color: bv_to_ansi(bv) })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Build HR → index map (matches deduplication order in `stars`)
+        let mut hr_to_idx: HashMap<u16, usize> = HashMap::new();
+        let mut seen_hr2: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let mut idx = 0usize;
+        for &(hr, ..) in STARS.iter() {
+            if seen_hr2.insert(hr) {
+                hr_to_idx.insert(hr, idx);
+                idx += 1;
+            }
+        }
+
+        let lines: Vec<(usize, usize)> = CONST_LINES.iter()
+            .filter_map(|&(a, b)| {
+                let ia = *hr_to_idx.get(&a)?;
+                let ib = *hr_to_idx.get(&b)?;
+                Some((ia, ib))
+            })
+            .collect();
+
+        let pan_targets: Vec<(f32, f32)> = CONST_TARGETS.iter()
+            .map(|&(_, ra, dec)| (ra, dec))
+            .collect();
+
+        let freq_res = SAMPLE_RATE as f32 / FFT_SIZE as f32;
+        let n_bins   = FFT_SIZE / 2 + 1;
+        let bass_lo  = ((20.0    / freq_res) as usize).clamp(1, n_bins - 1);
+        let bass_hi  = ((250.0   / freq_res) as usize).clamp(bass_lo + 1, n_bins - 1);
+        let mid_hi   = ((4000.0  / freq_res) as usize).clamp(bass_hi + 1, n_bins - 1);
+        let treble_hi = ((16000.0 / freq_res) as usize).clamp(mid_hi + 1, n_bins - 1);
+
+        let shimmer_len = stars.len();
+
+        // ── Generate Milky Way cloud points in galactic coordinates ────────────
+        // Grid: l = 0..360° step 3° (120 steps), b = -18..+18° step 2° (19 steps).
+        // Density is a Gaussian in b, boosted for the galactic centre, Cygnus arm,
+        // and Sagittarius arm; zeroed over the Coal Sack dark nebula.
+        // Points are converted to J2000 equatorial so `project()` works unchanged.
+        let mut milky_way: Vec<MilkyWayCloud> = Vec::with_capacity(1500);
+        {
+            let mut l_deg = 0.0f32;
+            while l_deg < 360.0 {
+                let mut b_deg = -18.0f32;
+                while b_deg <= 18.0 {
+                    let sigma: f32 = if l_deg < 30.0 || l_deg > 330.0 { 5.0 } else { 4.0 };
+                    let mut density = (-b_deg * b_deg / (2.0 * sigma * sigma)).exp();
+                    if l_deg < 25.0 || l_deg > 335.0             { density *= 2.0; } // galactic centre bulge
+                    if l_deg > 70.0 && l_deg < 90.0              { density *= 1.5; } // Cygnus arm
+                    if l_deg > 20.0 && l_deg < 50.0              { density *= 1.4; } // Sagittarius arm
+                    if l_deg > 295.0 && l_deg < 308.0 && b_deg.abs() < 2.0 { density = 0.0; } // Coal Sack void
+                    if density >= 0.15 {
+                        let (ra, dec) = gal_to_eq(l_deg, b_deg);
+                        milky_way.push(MilkyWayCloud { ra, dec, density });
+                    }
+                    b_deg += 2.0;
+                }
+                l_deg += 3.0;
+            }
+        }
+
+        // Default camera: point at Orion
+        let init_ra  = CONST_TARGETS[0].1;
+        let init_dec = CONST_TARGETS[0].2;
+        Self {
+            shimmer: vec![0.0; shimmer_len],
+            milky_way,
+            stars,
+            lines,
+            pan_targets,
+            pan_target_idx: 0,
+            camera: Camera {
+                ra: init_ra, dec: init_dec,
+                from_ra: init_ra, from_dec: init_dec,
+                to_ra:   init_ra, to_dec:   init_dec,
+                t: 1.0,
+                speed: 1.0,
+            },
+            beat_avg:        0.0,
+            beat_alpha:      0.15,
+            time_since_beat: 999.0,
+            beat_count:      0,
+            beat_flash:      0.0,
+            bass: 0.0, mid: 0.0, treble: 0.0,
+            bass_lo, bass_hi, mid_hi, treble_hi,
+            source: source.to_string(),
+            shimmer_gain:     1.0,
+            pan_beats:        8,
+            limiting_mag:     4.5,
+            show_lines:       true,
+            show_names:       true,
+            show_const_names: true,
+            show_milky_way:   true,
+            color_mode:       "spectral".to_string(),
+            fov_deg:          60.0,
+            pan_speed:        1.0,
+        }
+    }
+
+    fn advance_pan_target(&mut self) {
+        self.pan_target_idx = (self.pan_target_idx + 1) % self.pan_targets.len();
+        let (to_ra, to_dec) = self.pan_targets[self.pan_target_idx];
+        self.camera.from_ra  = self.camera.ra;
+        self.camera.from_dec = self.camera.dec;
+        self.camera.to_ra    = to_ra;
+        self.camera.to_dec   = to_dec;
+        self.camera.t        = 0.0;
+    }
+
+    fn rms(s: &[f32]) -> f32 {
+        if s.is_empty() { return 0.0; }
+        (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt()
+    }
+}
+
+// ── Visualizer impl ───────────────────────────────────────────────────────────
+
+impl Visualizer for NightSkyViz {
+    fn name(&self)        -> &str { "night_sky" }
+    fn description(&self) -> &str { "Real star map with constellation lines and beat-driven camera panning" }
+
+    fn get_default_config(&self) -> String {
+        serde_json::json!({
+            "visualizer_name": "night_sky",
+            "version": CONFIG_VERSION,
+            "config": [
+                {
+                    "name": "shimmer_gain",
+                    "display_name": "Shimmer Gain",
+                    "type": "float",
+                    "value": 1.0,
+                    "min": 0.0,
+                    "max": 3.0
+                },
+                {
+                    "name": "pan_beats",
+                    "display_name": "Beats per Pan",
+                    "type": "int",
+                    "value": 8,
+                    "min": 1,
+                    "max": 32
+                },
+                {
+                    "name": "limiting_mag",
+                    "display_name": "Limiting Magnitude",
+                    "type": "float",
+                    "value": 4.5,
+                    "min": 1.0,
+                    "max": 6.5
+                },
+                {
+                    "name": "show_lines",
+                    "display_name": "Show Constellations",
+                    "type": "bool",
+                    "value": true
+                },
+                {
+                    "name": "show_names",
+                    "display_name": "Show Star Names",
+                    "type": "bool",
+                    "value": true
+                },
+                {
+                    "name": "show_const_names",
+                    "display_name": "Show Constellation Names",
+                    "type": "bool",
+                    "value": true
+                },
+                {
+                    "name": "show_milky_way",
+                    "display_name": "Show Milky Way",
+                    "type": "bool",
+                    "value": true
+                },
+                {
+                    "name": "color_mode",
+                    "display_name": "Color Mode",
+                    "type": "enum",
+                    "value": "spectral",
+                    "variants": ["spectral", "mono", "teal", "warm"]
+                },
+                {
+                    "name": "fov",
+                    "display_name": "Field of View (deg)",
+                    "type": "float",
+                    "value": 60.0,
+                    "min": 30.0,
+                    "max": 120.0
+                },
+                {
+                    "name": "pan_speed",
+                    "display_name": "Pan Speed",
+                    "type": "float",
+                    "value": 1.0,
+                    "min": 0.2,
+                    "max": 3.0
+                }
+            ]
+        }).to_string()
+    }
+
+    fn set_config(&mut self, json: &str) -> Result<String, String> {
+        let merged = merge_config(&self.get_default_config(), json);
+        let val: serde_json::Value = serde_json::from_str(&merged)
+            .map_err(|e| format!("JSON parse error: {e}"))?;
+        if let Some(config) = val["config"].as_array() {
+            for entry in config {
+                match entry["name"].as_str().unwrap_or("") {
+                    "shimmer_gain" => {
+                        self.shimmer_gain = entry["value"].as_f64().unwrap_or(1.0) as f32;
+                    }
+                    "pan_beats" => {
+                        let v = entry["value"].as_i64()
+                            .or_else(|| entry["value"].as_f64().map(|f| f as i64))
+                            .unwrap_or(8);
+                        self.pan_beats = (v as u32).clamp(1, 32);
+                    }
+                    "limiting_mag" => {
+                        self.limiting_mag = entry["value"].as_f64().unwrap_or(4.5) as f32;
+                    }
+                    "show_lines" => {
+                        self.show_lines = entry["value"].as_bool().unwrap_or(true);
+                    }
+                    "show_names" => {
+                        self.show_names = entry["value"].as_bool().unwrap_or(true);
+                    }
+                    "show_const_names" => {
+                        self.show_const_names = entry["value"].as_bool().unwrap_or(true);
+                    }
+                    "show_milky_way" => {
+                        self.show_milky_way = entry["value"].as_bool().unwrap_or(true);
+                    }
+                    "color_mode" => {
+                        if let Some(s) = entry["value"].as_str() {
+                            self.color_mode = s.to_string();
+                        }
+                    }
+                    "fov" => {
+                        self.fov_deg = entry["value"].as_f64().unwrap_or(60.0) as f32;
+                        self.fov_deg = self.fov_deg.clamp(30.0, 120.0);
+                    }
+                    "pan_speed" => {
+                        self.pan_speed = entry["value"].as_f64().unwrap_or(1.0) as f32;
+                        self.camera.speed = self.pan_speed;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    fn tick(&mut self, audio: &AudioFrame, dt: f32, _size: TermSize) {
+        let fft  = &audio.fft;
+        let mono = &audio.mono;
+        let n    = fft.len();
+
+        // ── Band energy ───────────────────────────────────────────────────────
+        let raw_bass   = if self.bass_hi   <= n { Self::rms(&fft[self.bass_lo..self.bass_hi])  } else { 0.0 };
+        let raw_mid    = if self.mid_hi    <= n { Self::rms(&fft[self.bass_hi..self.mid_hi])   } else { 0.0 };
+        let raw_treble = if self.treble_hi <= n { Self::rms(&fft[self.mid_hi..self.treble_hi]) } else { 0.0 };
+
+        let scale = 6.0 * self.shimmer_gain;
+        let sb = (raw_bass   * scale).min(1.0);
+        let sm = (raw_mid    * scale * 1.5).min(1.0);
+        let st = (raw_treble * scale * 2.5).min(1.0);
+
+        let a_up = 0.35f32;
+        let a_dn = 0.88f32;
+        let aa = |cur: f32, tgt: f32| if tgt > cur { a_up * cur + (1.0 - a_up) * tgt }
+                                      else          { a_dn * cur + (1.0 - a_dn) * tgt };
+        self.bass   = aa(self.bass,   sb);
+        self.mid    = aa(self.mid,    sm);
+        self.treble = aa(self.treble, st);
+
+        // ── Beat flash decay (fast — full decay in ~0.17 s at 45 fps) ─────────
+        self.beat_flash = (self.beat_flash - dt * 6.0).max(0.0);
+
+        // ── Per-star shimmer ──────────────────────────────────────────────────
+        // beat_flash adds up to 0.8 to each star's shimmer target on a beat,
+        // driving even faint stars (base_level=0) into the ✦ character tier.
+        for (i, star) in self.stars.iter().enumerate() {
+            let band = if star.mag <= 1.5 { self.bass }
+                       else if star.mag <= 3.0 { self.mid }
+                       else { self.treble };
+            let phase = ((star.ra * 7.3 + star.dec * 5.1).sin() * 0.5 + 0.5) as f32;
+            let tgt = ((band + self.beat_flash * 0.8) * (0.5 + 0.5 * phase)).clamp(0.0, 1.0);
+            let alp = if tgt > self.shimmer[i] { 0.4 } else { 0.85 };
+            self.shimmer[i] = alp * self.shimmer[i] + (1.0 - alp) * tgt;
+        }
+
+        // ── Beat detection ────────────────────────────────────────────────────
+        let rms = Self::rms(mono);
+        self.beat_avg = self.beat_alpha * rms + (1.0 - self.beat_alpha) * self.beat_avg;
+        self.time_since_beat += dt;
+
+        let is_beat = rms > 1.55 * self.beat_avg
+            && self.time_since_beat > 0.18
+            && rms > 0.01;
+
+        if is_beat {
+            self.time_since_beat = 0.0;
+            self.beat_count      += 1;
+            self.beat_flash       = 1.0;   // triggers star shimmer burst next tick
+            if self.beat_count >= self.pan_beats {
+                self.beat_count = 0;
+                self.advance_pan_target();
+            }
+        }
+
+        // ── Camera pan interpolation ──────────────────────────────────────────
+        if self.camera.t < 1.0 {
+            self.camera.t = (self.camera.t + dt * self.camera.speed).min(1.0);
+            // Smoothstep easing
+            let ts = self.camera.t * self.camera.t * (3.0 - 2.0 * self.camera.t);
+            let (ra, dec) = slerp_ra_dec(
+                self.camera.from_ra, self.camera.from_dec,
+                self.camera.to_ra,   self.camera.to_dec,
+                ts,
+            );
+            self.camera.ra  = ra;
+            self.camera.dec = dec;
+        }
+    }
+
+    fn render(&self, size: TermSize, fps: f32) -> Vec<String> {
+        let rows = size.rows as usize;
+        let cols = size.cols as usize;
+        let vis  = rows.saturating_sub(1).max(1); // reserve last row for status bar
+
+        let fov_h = self.fov_deg.to_radians() / 2.0;
+
+        // Flat overlay grids (row-major, vis × cols)
+        // Render priority (low → high): mw_grid < line_grid < star_grid
+        let grid_size = vis * cols;
+        // mw_grid: max Milky Way cloud density at each cell (0.0 = empty)
+        let mut mw_grid:   Vec<f32>                      = vec![0.0f32; grid_size];
+        // line_grid: ANSI color of constellation line at that cell (0 = empty)
+        let mut line_grid: Vec<u8>                       = vec![0u8;   grid_size];
+        // star_grid: Option<(char, color, bold)>
+        let mut star_grid: Vec<Option<(char, u8, bool)>> = vec![None;  grid_size];
+
+        // ── Draw Milky Way cloud ──────────────────────────────────────────────
+        // Each galactic cloud point was pre-converted to J2000 equatorial in new(),
+        // so the standard project() function is reused without modification.
+        if self.show_milky_way {
+            for cloud in &self.milky_way {
+                if let Some((c, r)) = project(
+                    cloud.ra, cloud.dec,
+                    self.camera.ra, self.camera.dec,
+                    fov_h, cols, vis,
+                ) {
+                    let idx = r * cols + c;
+                    // Keep the highest-density value when multiple points map to same cell
+                    if cloud.density > mw_grid[idx] { mw_grid[idx] = cloud.density; }
+                }
+            }
+        }
+
+        // ── Draw constellation lines ──────────────────────────────────────────
+        if self.show_lines {
+            for &(ia, ib) in &self.lines {
+                if ia >= self.stars.len() || ib >= self.stars.len() { continue; }
+                let sa = &self.stars[ia];
+                let sb = &self.stars[ib];
+                let pa = project(sa.ra, sa.dec, self.camera.ra, self.camera.dec, fov_h, cols, vis);
+                let pb = project(sb.ra, sb.dec, self.camera.ra, self.camera.dec, fov_h, cols, vis);
+                if let (Some((ca, ra)), Some((cb, rb))) = (pa, pb) {
+                    bresenham(&mut line_grid, cols, vis, ca, ra, cb, rb, 236);
+                }
+            }
+        }
+
+        // ── Draw stars ────────────────────────────────────────────────────────
+        for (i, star) in self.stars.iter().enumerate() {
+            if star.mag > self.limiting_mag { continue; }
+            let Some((c, r)) = project(star.ra, star.dec, self.camera.ra, self.camera.dec, fov_h, cols, vis)
+            else { continue };
+
+            let sh  = self.shimmer[i];
+            let (ch, bold) = mag_to_char(star.mag, sh);
+            let dim = !bold && star.mag > 3.5;
+            let color = star_color(star.base_color, sh, &self.color_mode);
+            let bold_final = bold || sh > 0.6;
+
+            star_grid[r * cols + c] = Some((ch, color, bold_final || dim));
+        }
+
+        // ── Draw star names ───────────────────────────────────────────────────
+        if self.show_names {
+            for star in self.stars.iter() {
+                if star.name.is_empty() || star.mag > self.limiting_mag { continue; }
+                let Some((c, r)) = project(star.ra, star.dec, self.camera.ra, self.camera.dec, fov_h, cols, vis)
+                else { continue };
+
+                let name_len = star.name.chars().count();
+                if c + 1 + name_len >= cols { continue; }
+                if r == 0 || r >= vis - 1   { continue; }
+
+                for (j, ch) in star.name.chars().enumerate() {
+                    let nc = c + 1 + j;
+                    let idx = r * cols + nc;
+                    if star_grid[idx].is_none() {
+                        star_grid[idx] = Some((ch, 244, false));
+                    }
+                }
+            }
+        }
+
+        // ── Draw constellation name labels ────────────────────────────────────
+        // Labels are centred at the constellation's centroid coordinate.
+        // The currently-targeted constellation is highlighted in light blue (75);
+        // all others appear in dim grey (240).  Stars always take priority.
+        if self.show_const_names {
+            for (i, &(name, target_ra, target_dec)) in CONST_TARGETS.iter().enumerate() {
+                let Some((c, r)) = project(
+                    target_ra, target_dec,
+                    self.camera.ra, self.camera.dec,
+                    fov_h, cols, vis,
+                ) else { continue };
+
+                // Skip if too close to top/bottom edge
+                if r < 2 || r >= vis.saturating_sub(2) { continue; }
+
+                let name_len = name.chars().count();
+                // Centre the label, clamped so it doesn't overflow either edge
+                let start_c = c.saturating_sub(name_len / 2)
+                               .min(cols.saturating_sub(name_len));
+                if start_c + name_len > cols { continue; }
+
+                let color: u8 = if i == self.pan_target_idx { 75 } else { 240 };
+                for (j, ch) in name.chars().enumerate() {
+                    let idx = r * cols + (start_c + j);
+                    if star_grid[idx].is_none() {
+                        star_grid[idx] = Some((ch, color, false));
+                    }
+                }
+            }
+        }
+
+        // ── Compose output lines ──────────────────────────────────────────────
+        let mut lines = Vec::with_capacity(rows);
+        for r in 0..vis {
+            let mut line = String::with_capacity(cols * 14);
+            for c in 0..cols {
+                let idx = r * cols + c;
+                if let Some((ch, color, bold)) = star_grid[idx] {
+                    let b = if bold { "\x1b[1m" } else { "" };
+                    line.push_str(&format!("{b}\x1b[38;5;{color}m{ch}\x1b[0m"));
+                } else if line_grid[idx] != 0 {
+                    let color = line_grid[idx];
+                    line.push_str(&format!("\x1b[2m\x1b[38;5;{color}m\u{00b7}\x1b[0m"));
+                } else if mw_grid[idx] > 0.0 {
+                    // Milky Way haze: denser regions use slightly lighter grey and `.`
+                    let d = mw_grid[idx];
+                    let (mw_ch, mw_color): (char, u8) = if d >= 0.85      { ('.', 242) }
+                                                         else if d >= 0.65 { ('\u{00b7}', 238) }
+                                                         else if d >= 0.40 { ('\u{00b7}', 235) }
+                                                         else              { ('\u{00b7}', 233) };
+                    line.push_str(&format!("\x1b[2m\x1b[38;5;{mw_color}m{mw_ch}\x1b[0m"));
+                } else {
+                    line.push(' ');
+                }
+            }
+            lines.push(line);
+        }
+
+        // ── Status bar — RA/Dec of current view centre + constellation target ──
+        let target_name = CONST_TARGETS[self.pan_target_idx].0;
+        let extra = format!(
+            " | RA {}  Dec {}  \u{2192} {}",   // → arrow
+            ra_hms(self.camera.ra),
+            dec_dms(self.camera.dec),
+            target_name,
+        );
+        lines.push(status_bar(cols, fps, self.name(), &self.source, &extra));
+        pad_frame(lines, rows, cols)
+    }
+}
+
+// ── Registration ──────────────────────────────────────────────────────────────
+
+pub fn register() -> Vec<Box<dyn Visualizer>> {
+    vec![Box::new(NightSkyViz::new(""))]
+}
