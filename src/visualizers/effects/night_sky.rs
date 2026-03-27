@@ -24,8 +24,9 @@
 use std::collections::HashMap;
 use std::f32::consts::PI;
 
-use crate::visualizer::{
-    merge_config, pad_frame, status_bar, AudioFrame, TermSize, Visualizer, FFT_SIZE, SAMPLE_RATE,
+use crate::visualizer::{merge_config, pad_frame, status_bar, AudioFrame, TermSize, Visualizer};
+use crate::visualizer_utils::{
+    ansi_bold_fg, ansi_dim_fg, ansi_fg, band_energy, rms, smooth_asymmetric,
 };
 
 const CONFIG_VERSION: u64 = 1;
@@ -1252,10 +1253,6 @@ pub struct NightSkyViz {
     bass:      f32,
     mid:       f32,
     treble:    f32,
-    bass_lo:   usize,
-    bass_hi:   usize,
-    mid_hi:    usize,
-    treble_hi: usize,
 
     shimmer:    Vec<f32>,
     milky_way:  Vec<MilkyWayCloud>,
@@ -1504,13 +1501,6 @@ impl NightSkyViz {
             .map(|&(_, ra, dec)| (ra, dec))
             .collect();
 
-        let freq_res = SAMPLE_RATE as f32 / FFT_SIZE as f32;
-        let n_bins   = FFT_SIZE / 2 + 1;
-        let bass_lo  = ((20.0    / freq_res) as usize).clamp(1, n_bins - 1);
-        let bass_hi  = ((250.0   / freq_res) as usize).clamp(bass_lo + 1, n_bins - 1);
-        let mid_hi   = ((4000.0  / freq_res) as usize).clamp(bass_hi + 1, n_bins - 1);
-        let treble_hi = ((16000.0 / freq_res) as usize).clamp(mid_hi + 1, n_bins - 1);
-
         let shimmer_len = stars.len();
 
         // ── Generate Milky Way cloud points in galactic coordinates ────────────
@@ -1573,7 +1563,6 @@ impl NightSkyViz {
             drift_change_timer: 20.0,
             drift_seed:         0,
             bass: 0.0, mid: 0.0, treble: 0.0,
-            bass_lo, bass_hi, mid_hi, treble_hi,
             source: source.to_string(),
             shimmer_gain:     1.0,
             pan_beats:        8,
@@ -1602,10 +1591,6 @@ impl NightSkyViz {
         self.camera.t        = 0.0;
     }
 
-    fn rms(s: &[f32]) -> f32 {
-        if s.is_empty() { return 0.0; }
-        (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt()
-    }
 }
 
 // ── Visualizer impl ───────────────────────────────────────────────────────────
@@ -1790,12 +1775,11 @@ impl Visualizer for NightSkyViz {
     fn tick(&mut self, audio: &AudioFrame, dt: f32, _size: TermSize) {
         let fft  = &audio.fft;
         let mono = &audio.mono;
-        let n    = fft.len();
 
         // ── Band energy ───────────────────────────────────────────────────────
-        let raw_bass   = if self.bass_hi   <= n { Self::rms(&fft[self.bass_lo..self.bass_hi])  } else { 0.0 };
-        let raw_mid    = if self.mid_hi    <= n { Self::rms(&fft[self.bass_hi..self.mid_hi])   } else { 0.0 };
-        let raw_treble = if self.treble_hi <= n { Self::rms(&fft[self.mid_hi..self.treble_hi]) } else { 0.0 };
+        let raw_bass   = band_energy(fft, 20.0,   250.0);
+        let raw_mid    = band_energy(fft, 250.0,  4000.0);
+        let raw_treble = band_energy(fft, 4000.0, 16000.0);
 
         let scale = 6.0 * self.shimmer_gain;
         let sb = (raw_bass   * scale).min(1.0);
@@ -1804,11 +1788,9 @@ impl Visualizer for NightSkyViz {
 
         let a_up = 0.35f32;
         let a_dn = 0.88f32;
-        let aa = |cur: f32, tgt: f32| if tgt > cur { a_up * cur + (1.0 - a_up) * tgt }
-                                      else          { a_dn * cur + (1.0 - a_dn) * tgt };
-        self.bass   = aa(self.bass,   sb);
-        self.mid    = aa(self.mid,    sm);
-        self.treble = aa(self.treble, st);
+        self.bass   = smooth_asymmetric(self.bass,   sb, a_up, a_dn);
+        self.mid    = smooth_asymmetric(self.mid,    sm, a_up, a_dn);
+        self.treble = smooth_asymmetric(self.treble, st, a_up, a_dn);
 
         // ── Beat flash decay (fast — full decay in ~0.17 s at 45 fps) ─────────
         self.beat_flash = (self.beat_flash - dt * 6.0).max(0.0);
@@ -1827,13 +1809,13 @@ impl Visualizer for NightSkyViz {
         }
 
         // ── Beat detection ────────────────────────────────────────────────────
-        let rms = Self::rms(mono);
-        self.beat_avg = self.beat_alpha * rms + (1.0 - self.beat_alpha) * self.beat_avg;
+        let cur_rms = rms(mono);
+        self.beat_avg = self.beat_alpha * cur_rms + (1.0 - self.beat_alpha) * self.beat_avg;
         self.time_since_beat += dt;
 
-        let is_beat = rms > 1.55 * self.beat_avg
+        let is_beat = cur_rms > 1.55 * self.beat_avg
             && self.time_since_beat > 0.18
-            && rms > 0.01;
+            && cur_rms > 0.01;
 
         if is_beat {
             self.time_since_beat = 0.0;
@@ -2049,20 +2031,19 @@ impl Visualizer for NightSkyViz {
             for c in 0..cols {
                 let idx = r * cols + c;
                 if let Some((ch, color, bold)) = star_grid[idx] {
-                    let b = if bold { "\x1b[1m" } else { "" };
-                    line.push_str(&format!("{b}\x1b[38;5;{color}m{ch}\x1b[0m"));
+                    let s = if bold { ansi_bold_fg(ch, color) } else { ansi_fg(ch, color) };
+                    line.push_str(&s);
                 } else if line_grid[idx] != 0 {
                     let color = line_grid[idx];
-                    line.push_str(&format!("\x1b[2m\x1b[38;5;{color}m\u{00b7}\x1b[0m"));
+                    line.push_str(&ansi_dim_fg("·", color));
                 } else if dso_grid[idx].0 > 0.0 {
                     let (intensity, color) = dso_grid[idx];
-                    let ch = if intensity > 0.6 { '.' } else { '\u{00b7}' };
-                    line.push_str(&format!("\x1b[2m\x1b[38;5;{color}m{ch}\x1b[0m"));
+                    line.push_str(&ansi_dim_fg(if intensity > 0.6 { "." } else { "·" }, color));
                 } else if mw_grid[idx].0 > 0.0 {
                     let (d, color, bright) = mw_grid[idx];
-                    let dim = if bright { "" } else { "\x1b[2m" };
-                    let ch  = if d >= 0.85 { '.' } else { '\u{00b7}' };
-                    line.push_str(&format!("{dim}\x1b[38;5;{color}m{ch}\x1b[0m"));
+                    let ch = if d >= 0.85 { '.' } else { '·' };
+                    let s = if bright { ansi_fg(ch, color) } else { ansi_dim_fg(&ch.to_string(), color) };
+                    line.push_str(&s);
                 } else {
                     line.push(' ');
                 }
