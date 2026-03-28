@@ -1910,7 +1910,7 @@ impl NightSkyViz {
             color_mode:       "spectral".to_string(),
             fov_deg:          60.0,
             pan_speed:        1.0,
-            pan_timeout:      30.0,
+            pan_timeout:      10.0,
             drift_speed:   0.3,
             show_galaxies: true,
         }
@@ -2045,7 +2045,7 @@ impl Visualizer for NightSkyViz {
                     "name": "pan_timeout",
                     "display_name": "Pan Timeout (s)",
                     "type": "float",
-                    "value": 30.0,
+                    "value": 10.0,
                     "min": 0.0,
                     "max": 300.0
                 },
@@ -2189,7 +2189,7 @@ impl Visualizer for NightSkyViz {
                         self.pan_beats = (v as u32).clamp(1, 32);
                     }
                     "pan_timeout" => {
-                        self.pan_timeout = (entry["value"].as_f64().unwrap_or(30.0) as f32)
+                        self.pan_timeout = (entry["value"].as_f64().unwrap_or(10.0) as f32)
                             .clamp(0.0, 300.0);
                     }
                     "limiting_mag" => {
