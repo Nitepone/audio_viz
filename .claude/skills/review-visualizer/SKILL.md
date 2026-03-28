@@ -1,6 +1,6 @@
 ---
 name: review-visualizer
-description: Pre-commit quality check for a visualizer file. Verifies structural correctness, convention compliance, config consistency, and that the file builds for both native and WASM targets.
+description: Pre-commit quality check for a visualizer file. Verifies structural correctness, convention compliance, config consistency, and that the file builds cleanly.
 argument-hint: <path/to/visualizer.rs>
 ---
 
@@ -58,22 +58,10 @@ pub fn register() -> Vec<Box<dyn Visualizer>> {
 - Passes `""` as source (runtime replaces it).
 - Returns a `Vec` not a single boxed value.
 
-### 6. Builds for both targets
-Run these in order; fix errors before moving to the next:
+### 6. Builds cleanly
+Run `cargo check --lib` and fix any errors or warnings before proceeding.
 
-```bash
-cargo check
-```
-```bash
-cd web && wasm-pack build --target web --out-dir pkg --release 2>&1 | tail -20
-```
-
-WASM failures are often caused by:
-- Using `std::time`, threads, or `rand` without WASM-compatible feature flags
-- Importing a `terminal`-feature-gated symbol outside a `#[cfg(feature = "terminal")]` guard
-- Any `eprintln!` / `println!` (use `web_sys::console::log_1` or remove)
-
-If a symbol is terminal-only, it must be gated. Check `Cargo.toml` for the `terminal` feature definition if unsure what's gated.
+Never run the WASM build (`wasm-pack`) locally — that is handled by CI only.
 
 ---
 
