@@ -50,12 +50,12 @@ async function initWasm() {
     catSelect.appendChild(opt);
   }
 
-  // Default to whichever category contains 'scope', else first category
-  const defaultCat = categories.find(([, names]) => names.includes('scope'))?.[0]
+  // Default to whichever category contains 'spectrum', else first category
+  const defaultCat = categories.find(([, names]) => names.includes('spectrum'))?.[0]
     ?? categories[0]?.[0];
   if (defaultCat) catSelect.value = defaultCat;
 
-  populateVizSelect(catSelect.value, 'scope');
+  populateVizSelect(catSelect.value, 'spectrum');
   makeViz(vizSelect.value);
 
   // Show system audio button only on supported browsers (Chrome/Edge desktop)
