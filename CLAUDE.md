@@ -33,6 +33,8 @@ cd web
 wasm-pack build --target web --out-dir pkg --release
 ```
 
+> **Note:** When building or testing locally, always use the terminal binary (`cargo build --release` or `cargo check --lib`). Never run the WASM build (`wasm-pack`) — it requires additional toolchain setup and is handled by CI only.
+
 ## Adding a Visualizer
 
 Visualizers are **auto-discovered at compile time** — no manual registration needed.
