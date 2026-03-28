@@ -240,7 +240,7 @@ impl Visualizer for SpectrumViz {
                     "name": "theme",
                     "display_name": "Theme",
                     "type": "enum",
-                    "value": "classic",
+                    "value": "hifi",
                     "variants": ["classic", "hifi", "led", "phosphor", "mono"]
                 }
             ]
