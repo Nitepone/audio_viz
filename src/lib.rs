@@ -9,3 +9,6 @@ pub mod beat;
 pub mod visualizer;
 pub mod visualizer_utils;
 pub mod visualizers;
+
+#[cfg(feature = "tvos")]
+pub mod ffi;

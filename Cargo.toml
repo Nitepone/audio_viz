@@ -10,8 +10,9 @@ description = "Multi-mode terminal audio visualizer"
 build       = "build.rs"
 
 [lib]
-name = "audio_viz"
-path = "src/lib.rs"
+name      = "audio_viz"
+path      = "src/lib.rs"
+crate-type = ["lib", "staticlib"]
 
 [[bin]]
 name              = "audio_viz"
@@ -25,6 +26,7 @@ required-features = ["terminal"]
 # without activating it, which keeps crossterm/cpal/clap out of the WASM build.
 default  = ["terminal"]
 terminal = ["dep:crossterm", "dep:cpal", "dep:clap", "dep:anyhow"]
+tvos     = []
 
 [dependencies]
 rustfft    = "6"

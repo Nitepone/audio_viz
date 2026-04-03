@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for MusicKit library access and Apple Music playback.      -->
+    <!-- Must be enabled in App Store Connect before submitting to the store. -->
+    <key>com.apple.developer.musickit</key>
+    <true/>
+</dict>
+</plist>

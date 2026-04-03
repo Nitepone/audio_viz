@@ -1,0 +1,108 @@
+name: AudioViz
+
+options:
+  bundleIdPrefix: com.audioviz
+  deploymentTarget:
+    tvOS: "17.0"
+  xcodeVersion: "16"
+  generateEmptyDirectories: true
+  groupSortPosition: none
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    TARGETED_DEVICE_FAMILY: "3"          # 3 = Apple TV
+    SUPPORTED_PLATFORMS: appletvos appletvsimulator
+    SUPPORTS_MACCATALYST: NO
+
+targets:
+  AudioViz:
+    type: application
+    platform: tvOS
+    deploymentTarget: "17.0"
+
+    sources:
+      - path: AudioViz
+        excludes:
+          - "**/.DS_Store"
+      # stub.c provides aviz_* symbols for simulator builds.
+      # Excluded from device builds where libaudio_viz.a provides the real symbols.
+      - path: bridge/stub.c
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.audioviz.AudioViz
+        PRODUCT_NAME: AudioViz
+
+        # Rust bridging header — exposes the aviz_* C functions to Swift
+        SWIFT_OBJC_BRIDGING_HEADER: AudioViz/AudioViz-Bridging-Header.h
+        SWIFT_INSTALL_OBJC_HEADER: NO
+
+        # Where to find libaudio_viz.a
+        LIBRARY_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/bridge"
+          - "$(inherited)"
+
+        # Device:    libaudio_viz.a     (aarch64-apple-tvos, from build-rust.sh)
+        # Simulator: libaudio_viz_sim.a (aarch64-apple-tvos-sim, from build-rust.sh)
+        # stub.c is excluded from both — it is only a fallback for local dev
+        # before the real libraries are built.
+        #
+        # $(inherited) is omitted from conditionals to prevent the base flags
+        # from being duplicated via xcconfig inheritance.
+        OTHER_LDFLAGS:
+          - "-lc++"
+          - "-framework CoreFoundation"
+        OTHER_LDFLAGS[sdk=appletvos*]:
+          - "-laudio_viz"
+          - "-lc++"
+          - "-framework CoreFoundation"
+        OTHER_LDFLAGS[sdk=appletvsimulator*]:
+          - "-laudio_viz_sim"
+          - "-lc++"
+          - "-framework CoreFoundation"
+
+        # Exclude stub.c from both device and simulator builds; the real .a files
+        # provide aviz_* symbols for both platforms.
+        EXCLUDED_SOURCE_FILE_NAMES[sdk=appletvos*]: stub.c
+        EXCLUDED_SOURCE_FILE_NAMES[sdk=appletvsimulator*]: stub.c
+
+        # Standard tvOS app settings
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: AudioViz/AudioViz.entitlements
+        ENABLE_PREVIEWS: YES
+
+    dependencies:
+      - sdk: frameworks/CoreFoundation.framework
+
+    info:
+      path: AudioViz/Info.plist
+      properties:
+        CFBundleDisplayName: AudioViz
+        LSApplicationCategoryType: public.app-category.music
+        NSAppleMusicUsageDescription: "AudioViz plays your Apple Music library and visualizes the audio in real time."
+        UILaunchScreen:
+          UILaunchScreen: {}
+        # tvOS only supports landscape
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Apple TV has no microphone; audio is captured via AVAudioEngine output tap
+
+schemes:
+  AudioViz:
+    build:
+      targets:
+        AudioViz: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
