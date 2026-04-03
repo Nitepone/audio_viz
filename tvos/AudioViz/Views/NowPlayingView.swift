@@ -39,7 +39,9 @@ struct NowPlayingView: View {
             VStack(spacing: 20) {
                 trackInfoRow
                 transportRow
+                    .focusSection()
                 actionRow
+                    .focusSection()
             }
             .padding(.horizontal, 80)
             .padding(.bottom, 60)

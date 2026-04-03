@@ -12,11 +12,20 @@ import SwiftUI
 //
 //   cols = 80,  rows = 45
 //   cellW = 1920 / 80 = 24 pt,  cellH = 1080 / 45 = 24 pt
-//   font  ≈ 20 pt monospaced — fills ~83% of each cell
+//
+// Rendering strategy
+// ──────────────────
+// Block characters (█ ▓ ▒ ░ and half-blocks ▀ ▄ ▌ ▐) are drawn as filled
+// rectangles via ctx.fill(Path(rect)).  This eliminates the gaps that SwiftUI
+// Text rendering introduces through internal line-height and padding.
+//
+// All other characters (letters, digits, symbols, box-drawing, etc.) are drawn
+// with ctx.draw(Text(…)) using a monospaced font sized at 95% of the cell to
+// minimise inter-cell gaps while avoiding clipping.
 //
 // Performance
 // ───────────
-// At 80×45 = 3 600 cells, drawing each character individually is the
+// At 80×45 = 3 600 cells, drawing each cell individually is the
 // straightforward approach and comfortably within Apple TV's GPU budget at
 // 45 fps.  If profiling ever shows a bottleneck, switch to a Metal-backed
 // layer that uploads a texture atlas.
@@ -30,6 +39,26 @@ enum CellRenderer {
     /// Character grid height used by the Rust core.
     static let rows = 45
 
+    // MARK: - Block character tables
+
+    /// Full-block characters drawn as filled rectangles covering the entire cell.
+    /// Mapped to opacity: █ = 1.0, ▓ = 0.75, ▒ = 0.50, ░ = 0.25.
+    private static let fullBlockOpacity: [Character: Double] = [
+        "█": 1.0,
+        "▓": 0.75,
+        "▒": 0.50,
+        "░": 0.25,
+    ]
+
+    /// Half-block characters drawn as filled rectangles covering part of the cell.
+    /// Values are (xFrac, yFrac, wFrac, hFrac) relative to the cell rect.
+    private static let halfBlockRect: [Character: (CGFloat, CGFloat, CGFloat, CGFloat)] = [
+        "▀": (0,   0,   1,   0.5),   // top half
+        "▄": (0,   0.5, 1,   0.5),   // bottom half
+        "▌": (0,   0,   0.5, 1  ),   // left half
+        "▐": (0.5, 0,   0.5, 1  ),   // right half
+    ]
+
     // MARK: - Draw
 
     /// Draw all cells into `ctx` at the given canvas size.
@@ -41,14 +70,13 @@ enum CellRenderer {
 
         let cellW    = size.width  / CGFloat(cols)
         let cellH    = size.height / CGFloat(rows)
-        // Keep the font slightly smaller than the cell so characters don't clip
-        let fontSize = floor(min(cellW, cellH) * 0.82)
+        // Text font — 95% of cell height to minimise gaps without clipping
+        let fontSize = floor(min(cellW, cellH) * 0.95)
         let font     = Font.system(size: fontSize, design: .monospaced)
 
         for cell in cells {
-            // Centre the character within its cell
-            let x = CGFloat(cell.col) * cellW + cellW * 0.5
-            let y = CGFloat(cell.row) * cellH + cellH * 0.5
+            let x = CGFloat(cell.col) * cellW
+            let y = CGFloat(cell.row) * cellH
 
             let color = Color(
                 red:   Double(cell.r) / 255,
@@ -56,13 +84,33 @@ enum CellRenderer {
                 blue:  Double(cell.b) / 255
             )
 
-            ctx.draw(
-                Text(cell.ch)
-                    .font(font)
-                    .foregroundColor(color),
-                at: CGPoint(x: x, y: y),
-                anchor: .center
-            )
+            let ch: Character = cell.ch.first ?? " "
+
+            if let opacity = fullBlockOpacity[ch] {
+                // ── Full-block: fill entire cell as a rectangle ───────────
+                let rect = CGRect(x: x, y: y, width: cellW, height: cellH)
+                ctx.fill(Path(rect), with: .color(color.opacity(opacity)))
+
+            } else if let frac = halfBlockRect[ch] {
+                // ── Half-block: fill a portion of the cell ────────────────
+                let rect = CGRect(
+                    x: x + frac.0 * cellW,
+                    y: y + frac.1 * cellH,
+                    width: frac.2 * cellW,
+                    height: frac.3 * cellH
+                )
+                ctx.fill(Path(rect), with: .color(color))
+
+            } else {
+                // ── Text character: draw centred in the cell ──────────────
+                ctx.draw(
+                    Text(cell.ch)
+                        .font(font)
+                        .foregroundColor(color),
+                    at: CGPoint(x: x + cellW * 0.5, y: y + cellH * 0.5),
+                    anchor: .center
+                )
+            }
         }
     }
 

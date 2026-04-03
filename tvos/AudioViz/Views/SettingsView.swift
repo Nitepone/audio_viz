@@ -4,9 +4,9 @@ import SwiftUI
 //
 // Dynamic settings form driven by the active visualizer's config JSON.
 //
-// • Float  → Slider (Siri Remote swipe left/right adjusts value)
-// • Enum   → Picker (segmented or inline)
-// • Bool   → Toggle
+// • Float/Int → +/− buttons with value display and range indicator
+// • Enum     → Horizontal inline buttons (not Picker — avoids blurry sheet)
+// • Bool     → Toggle
 //
 // Changes are applied immediately via bridge.setConfig().
 // "Reset to Defaults" reloads the original config from the bridge.
@@ -33,13 +33,13 @@ struct SettingsView: View {
                             ConfigRow(item: $item) {
                                 applyConfig()
                             }
-                            .listRowInsets(EdgeInsets(top: 8, leading: 20, bottom: 8, trailing: 20))
+                            .listRowInsets(EdgeInsets(top: 12, leading: 40, bottom: 12, trailing: 40))
                         }
                         Section {
                             Button("Reset to Defaults", role: .destructive) {
                                 loadConfig()
                             }
-                            .listRowInsets(EdgeInsets(top: 8, leading: 20, bottom: 8, trailing: 20))
+                            .listRowInsets(EdgeInsets(top: 12, leading: 40, bottom: 12, trailing: 40))
                         }
                     }
                 }
@@ -103,29 +103,42 @@ private struct ConfigRow: View {
         let hi      = max(item.max ?? 1.0, lo + 0.001)
         let step    = (hi - lo) / 20.0
         let current = item.value.doubleValue ?? lo
+        let fraction = (current - lo) / (hi - lo)
 
         return HStack(spacing: 20) {
             Text(item.display_name)
             Spacer()
+
             Button {
                 item.value = .double(max(lo, current - step))
                 onChange()
             } label: {
-                Image(systemName: "minus.circle.fill").font(.title2)
+                Image(systemName: "minus.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.primary)
             }
             .buttonStyle(.plain)
+            .hoverEffect(.highlight)
 
-            Text(String(format: "%.2f", current))
-                .monospacedDigit()
-                .frame(width: 64, alignment: .center)
+            VStack(spacing: 4) {
+                Text(String(format: "%.2f", current))
+                    .monospacedDigit()
+                    .frame(width: 80, alignment: .center)
+                ProgressView(value: fraction)
+                    .frame(width: 80)
+                    .tint(.accentColor)
+            }
 
             Button {
                 item.value = .double(min(hi, current + step))
                 onChange()
             } label: {
-                Image(systemName: "plus.circle.fill").font(.title2)
+                Image(systemName: "plus.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.primary)
             }
             .buttonStyle(.plain)
+            .hoverEffect(.highlight)
         }
     }
 
@@ -135,29 +148,43 @@ private struct ConfigRow: View {
         let lo      = Int(item.min ?? 0)
         let hi      = Int(item.max ?? 100)
         let current = Int(item.value.doubleValue ?? Double(lo))
+        let range   = Double(max(hi - lo, 1))
+        let fraction = Double(current - lo) / range
 
         return HStack(spacing: 20) {
             Text(item.display_name)
             Spacer()
+
             Button {
                 item.value = .double(Double(max(lo, current - 1)))
                 onChange()
             } label: {
-                Image(systemName: "minus.circle.fill").font(.title2)
+                Image(systemName: "minus.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.primary)
             }
             .buttonStyle(.plain)
+            .hoverEffect(.highlight)
 
-            Text("\(current)")
-                .monospacedDigit()
-                .frame(width: 64, alignment: .center)
+            VStack(spacing: 4) {
+                Text("\(current)")
+                    .monospacedDigit()
+                    .frame(width: 80, alignment: .center)
+                ProgressView(value: fraction)
+                    .frame(width: 80)
+                    .tint(.accentColor)
+            }
 
             Button {
                 item.value = .double(Double(min(hi, current + 1)))
                 onChange()
             } label: {
-                Image(systemName: "plus.circle.fill").font(.title2)
+                Image(systemName: "plus.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.primary)
             }
             .buttonStyle(.plain)
+            .hoverEffect(.highlight)
         }
     }
 
@@ -188,9 +215,10 @@ private struct ConfigRow: View {
                                 .foregroundStyle(selected ? Color.white : Color.primary)
                         }
                         .buttonStyle(.plain)
-                        .hoverEffect()
+                        .hoverEffect(.highlight)
                     }
                 }
+                .padding(.horizontal, 20)
             }
         }
         .padding(.vertical, 4)

@@ -1,0 +1,125 @@
+# tvOS build — currently disabled (manual trigger only).
+# Enable by adding push/tag triggers when ready for automated builds.
+name: tvOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Build profile"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+env:
+  RUST_NIGHTLY: nightly
+
+jobs:
+  # ── Rust static library ────────────────────────────────────────────────────
+  # Cross-compiles the Rust core to aarch64-apple-tvos (device) and simulator
+  # fat library (arm64 + x86_64).
+  rust:
+    runs-on: macos-latest
+    outputs:
+      profile: ${{ steps.vars.outputs.profile }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set build variables
+        id: vars
+        run: |
+          PROFILE="${{ inputs.profile || 'release' }}"
+          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache Cargo registry and build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: tvos-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: tvos-cargo-
+
+      - name: Build Rust static libraries
+        run: |
+          PROFILE="${{ steps.vars.outputs.profile }}"
+          if [ "$PROFILE" = "release" ]; then
+            ./tvos/build-rust.sh
+          else
+            ./tvos/build-rust.sh --debug
+          fi
+
+      - name: Upload Rust libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: tvos-rust-libs
+          path: |
+            tvos/bridge/libaudio_viz.a
+            tvos/bridge/libaudio_viz_sim.a
+          if-no-files-found: error
+
+  # ── Xcode build ────────────────────────────────────────────────────────────
+  # Builds the tvOS app for both device and simulator to catch Swift compiler
+  # errors.  Does not archive or sign — that requires manual Xcode or a
+  # separate signing workflow.
+  xcode:
+    needs: rust
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Rust libraries
+        uses: actions/download-artifact@v4
+        with:
+          name: tvos-rust-libs
+          path: tvos/bridge
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: tvos
+        run: xcodegen generate
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      # Build for simulator — validates Swift compilation without code signing
+      - name: Build for tvOS Simulator
+        working-directory: tvos
+        run: |
+          xcodebuild \
+            -project AudioViz.xcodeproj \
+            -scheme AudioViz \
+            -destination 'generic/platform=tvOS Simulator' \
+            -sdk appletvsimulator \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      # Build for device — validates real Rust library links correctly
+      - name: Build for tvOS Device
+        working-directory: tvos
+        run: |
+          xcodebuild \
+            -project AudioViz.xcodeproj \
+            -scheme AudioViz \
+            -destination 'generic/platform=tvOS' \
+            -sdk appletvos \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build

@@ -114,7 +114,7 @@ Returned `const char *` pointers are owned by the handle and valid only until th
 }
 ```
 
-`SettingsView` decodes this into `[ConfigItem]`, renders dynamic controls (float → `+/−` buttons, enum → `Picker`, bool → `Toggle`), and sends the full modified JSON back via `aviz_set_config`.
+`SettingsView` decodes this into `[ConfigItem]`, renders dynamic controls (float/int → `+/−` buttons, enum → inline horizontal buttons, bool → `Toggle`), and sends the full modified JSON back via `aviz_set_config`.
 
 ### Grid layout
 
@@ -140,6 +140,24 @@ App.swift
 
 All `@Published` mutations happen on `@MainActor`. The audio callback captures `RustBridge` directly (not `self`) to avoid actor-hop overhead on every frame.
 
+## Known Issues (Phase 8)
+
+### Visualizer rendering — gaps and zoom
+The visualizer appears "zoomed in" with visible gaps between characters. Root cause: `CellRenderer.draw()` sizes the font at 82% of the cell (≈20 pt in a 24 pt cell), which leaves ~4 pt of empty space per cell. Block characters (`█`) don't tile seamlessly because SwiftUI's `Text` rendering adds internal padding/line-height beyond the requested font size. The fix is to either:
+1. Increase the font size closer to 100% of cell height and use `.baselineOffset` to correct vertical alignment, or
+2. Switch from `Text` drawing to `ctx.fill(Path(rect))` for solid block characters and only use `Text` for non-block glyphs — this eliminates font metrics gaps entirely.
+
+Additionally, the grid is 80×45 which gives 24×24 pt cells. Some visualizers may render content in a sub-region of the grid, contributing to the "zoomed in" feel. Consider increasing the grid to a higher density (e.g., 120×50 or 160×67) if the 45 fps budget allows it.
+
+### NowPlayingView — navigation between rows
+The Siri Remote D-pad cannot move focus between the transport row (play/pause/skip buttons) and the action row (Library/Visualizers/Settings) below it. All buttons use `.buttonStyle(.plain)` which may interfere with tvOS focus engine. The fix requires explicit `@FocusState` management or using `.focusSection()` modifiers so the focus engine treats each row as a navigable section.
+
+### SettingsView — margins and missing editors
+- Row insets are cramped (8 pt top/bottom, 20 pt leading/trailing)
+- The `+/−` buttons for float/int fields have no visible focus ring or highlight beyond the default system hover
+- Enum buttons lack sufficient padding in the scrolling area
+- No visual feedback showing the current value's position within the min/max range
+
 ## Adding a visualizer
 
 Visualizers are defined in Rust (`../src/visualizers/`). The tvOS app discovers them at runtime via `aviz_list_visualizers()` — no Swift changes needed when a new Rust visualizer is added. After adding a Rust visualizer, rebuild the static library:
@@ -147,6 +165,25 @@ Visualizers are defined in Rust (`../src/visualizers/`). The tvOS app discovers 
 ```bash
 ./build-rust.sh
 ```
+
+## Skills
+
+The following Claude Code skills are available for tvOS development:
+
+- `/tvos-review <path/to/File.swift>` — Pre-build quality check. Validates tvOS API compliance, focus handling, environment object passing, and config consistency.
+- `/tvos-add-view <ViewName>` — Scaffold a new SwiftUI view with correct boilerplate (NavigationStack, @EnvironmentObject, focus sections) and wire it into NowPlayingView as a sheet.
+
+These complement the Rust-side skills (`/add-config-field`, `/review-visualizer`, `/new-visualizer`, etc.) which apply to the shared core library.
+
+## CI
+
+GitHub Actions workflow at `.github/workflows/tvos.yml`. Currently **manual dispatch only** (`workflow_dispatch`) — not triggered on push.
+
+Two jobs:
+1. **rust** — Installs Rust nightly + rust-src, runs `build-rust.sh` to cross-compile `libaudio_viz.a` and `libaudio_viz_sim.a`, uploads as artifacts.
+2. **xcode** — Downloads Rust libs, installs XcodeGen, regenerates `.xcodeproj`, builds for both simulator and device (unsigned).
+
+To enable automatic runs, add `push: branches: [main]` and `tags: ['v*']` triggers.
 
 ## Modifying the Xcode project
 
