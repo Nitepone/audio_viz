@@ -9,7 +9,7 @@
 ///   frequency_scale — linear / log
 ///   peak_hold      — 0–3 s: time a peak marker stays lit before fading
 
-// ── Index: palettes@27 · WaterfallViz@53 · new@72 · impl@168 · config@172 · set_config@226 · tick@271 · render@311 · register@379
+// ── Index: palettes@30 · WaterfallViz@58 · new@88 · freq_to_col@171 · col_to_bin@196 · rebuild_dsp@229 · impl@273 · config@277 · set_config@387 · tick@463 · render@518 · register@586
 use crate::visualizer::{
     merge_config,
     pad_frame, specgrad, status_bar,
@@ -18,8 +18,13 @@ use crate::visualizer::{
 use crate::visualizer_utils::{
     palette_lookup, mag_to_frac as mag_to_frac_generic,
 };
+use crate::dsp::{
+    AWeightFilter, BandPreset, BandpassFilter, DspChain, HpssFilter,
+    MidSideFilter, PreEmphasisFilter, SpectralContrastFilter,
+    SpectralDiffFilter, SpectralWhiteningFilter,
+};
 
-const CONFIG_VERSION: u64 = 1;
+const CONFIG_VERSION: u64 = 2;
 
 // ── Colour palettes ────────────────────────────────────────────────────────────
 
@@ -66,6 +71,17 @@ pub struct WaterfallViz {
     frequency_scale: String, // "linear" | "log"
     peak_hold:       f32,    // seconds
     freq_axis:       bool,
+    // ── DSP filters ──────────────────────────────────────────────────────────
+    dsp_chain:        DspChain,
+    mid_side:         Option<MidSideFilter>,
+    cfg_stereo_field: String,   // "stereo" | "mid" | "side"
+    cfg_band_filter:  String,   // "off" | "bass" | "mids" | "vocal" | "presence" | "air"
+    cfg_a_weight:         bool,
+    cfg_whitening:        bool,
+    cfg_pre_emphasis:     bool,
+    cfg_spectral_diff:    bool,
+    cfg_spectral_contrast: bool,
+    cfg_hpss:             String,  // "off" | "harmonic" | "percussive"
 }
 
 impl WaterfallViz {
@@ -83,6 +99,16 @@ impl WaterfallViz {
             frequency_scale: "log".to_string(),
             peak_hold:       1.0,
             freq_axis:       false,
+            dsp_chain:        DspChain::new(),
+            mid_side:         None,
+            cfg_stereo_field: "stereo".to_string(),
+            cfg_band_filter:  "off".to_string(),
+            cfg_a_weight:         false,
+            cfg_whitening:        false,
+            cfg_pre_emphasis:     false,
+            cfg_spectral_diff:    false,
+            cfg_spectral_contrast: false,
+            cfg_hpss:             "off".to_string(),
         }
     }
 
@@ -114,7 +140,8 @@ impl WaterfallViz {
 
         let n_bins = FFT_SIZE / 2 + 1;
         let nyquist = SAMPLE_RATE as f32 / 2.0;
-        let log = self.frequency_scale == "log";
+        let freq_res = nyquist / n_bins as f32;
+        let scale = self.frequency_scale.as_str();
 
         // Build plain character buffer first
         let mut buf = vec![b' '; cols];
@@ -122,17 +149,8 @@ impl WaterfallViz {
         // Draw tick marks at key freq positions
         for &(freq, label) in LABELS {
             if freq > nyquist { break; }
-            // Column for this frequency
-            let col = if log {
-                let lo = 1.0f32.ln();
-                let hi = (n_bins as f32).ln();
-                let bin = (freq / (SAMPLE_RATE as f32 / FFT_SIZE as f32)) as f32;
-                let t = ((bin.max(1.0).ln() - lo) / (hi - lo)).clamp(0.0, 1.0);
-                (t * (cols - 1) as f32) as usize
-            } else {
-                let bin_frac = freq / nyquist;
-                (bin_frac * (cols - 1) as f32) as usize
-            };
+            // Column for this frequency (inverse of col_to_bin)
+            let col = Self::freq_to_col(freq, cols, n_bins, freq_res, nyquist, scale);
             if col >= cols { continue; }
             // Write the label left-aligned from the tick column
             let bytes = label.as_bytes();
@@ -149,17 +167,104 @@ impl WaterfallViz {
         line
     }
 
+    /// Map a frequency (Hz) to a column index (inverse of col_to_bin).
+    fn freq_to_col(freq: f32, cols: usize, n_bins: usize, freq_res: f32, nyquist: f32, scale: &str) -> usize {
+        use crate::dsp::{hz_to_mel, hz_to_bark};
+        let t = match scale {
+            "log" => {
+                let lo = 1.0f32.ln();
+                let hi = (n_bins as f32).ln();
+                let bin = (freq / freq_res).max(1.0);
+                (bin.ln() - lo) / (hi - lo)
+            }
+            "mel" => {
+                let mel_lo = hz_to_mel(freq_res);
+                let mel_hi = hz_to_mel(nyquist);
+                (hz_to_mel(freq) - mel_lo) / (mel_hi - mel_lo)
+            }
+            "bark" => {
+                let bark_lo = hz_to_bark(freq_res);
+                let bark_hi = hz_to_bark(nyquist);
+                (hz_to_bark(freq) - bark_lo) / (bark_hi - bark_lo)
+            }
+            _ => freq / nyquist, // linear
+        };
+        (t.clamp(0.0, 1.0) * (cols - 1) as f32) as usize
+    }
+
     /// Map a column index (0..cols) to an FFT bin index, honouring freq scale.
-    fn col_to_bin(c: usize, cols: usize, n_bins: usize, log: bool) -> usize {
-        if log {
-            // log scale: map c to a bin with log spacing
-            let lo = 1.0f32.ln();
-            let hi = (n_bins as f32).ln();
-            let t  = c as f32 / cols.max(1) as f32;
-            ((lo + t * (hi - lo)).exp() as usize).clamp(1, n_bins - 1)
-        } else {
-            (c * n_bins / cols.max(1)).clamp(0, n_bins - 1)
+    fn col_to_bin(c: usize, cols: usize, n_bins: usize, scale: &str) -> usize {
+        use crate::dsp::{hz_to_mel, mel_to_hz, hz_to_bark, bark_to_hz};
+        use crate::visualizer::SAMPLE_RATE;
+        let t = c as f32 / cols.max(1) as f32;
+        let nyquist = SAMPLE_RATE as f32 / 2.0;
+        let freq_res = nyquist / n_bins.max(1) as f32;
+        match scale {
+            "log" => {
+                let lo = 1.0f32.ln();
+                let hi = (n_bins as f32).ln();
+                ((lo + t * (hi - lo)).exp() as usize).clamp(1, n_bins - 1)
+            }
+            "mel" => {
+                let mel_lo = hz_to_mel(freq_res);        // ~1 bin
+                let mel_hi = hz_to_mel(nyquist);
+                let mel = mel_lo + t * (mel_hi - mel_lo);
+                let hz = mel_to_hz(mel);
+                ((hz / freq_res) as usize).clamp(1, n_bins - 1)
+            }
+            "bark" => {
+                let bark_lo = hz_to_bark(freq_res);
+                let bark_hi = hz_to_bark(nyquist);
+                let bark = bark_lo + t * (bark_hi - bark_lo);
+                let hz = bark_to_hz(bark);
+                ((hz / freq_res) as usize).clamp(1, n_bins - 1)
+            }
+            _ => { // "linear"
+                (c * n_bins / cols.max(1)).clamp(0, n_bins - 1)
+            }
         }
+    }
+
+    /// Rebuild the filter chain from current `cfg_*` fields.
+    fn rebuild_dsp_chain(&mut self) {
+        use crate::visualizer::SAMPLE_RATE;
+        let mut filters: Vec<Box<dyn crate::dsp::DspFilter>> = Vec::new();
+
+        // Time-domain filters (order matters: pre-emphasis before bandpass)
+        if self.cfg_pre_emphasis {
+            filters.push(Box::new(PreEmphasisFilter::standard()));
+        }
+        if let Some(preset) = BandPreset::from_str(&self.cfg_band_filter) {
+            filters.push(Box::new(BandpassFilter::new(preset, SAMPLE_RATE as f32)));
+        }
+
+        // Frequency-domain filters (order: HPSS → contrast → diff → a-weight → whitening)
+        match self.cfg_hpss.as_str() {
+            "harmonic"  => filters.push(Box::new(HpssFilter::harmonic())),
+            "percussive" => filters.push(Box::new(HpssFilter::percussive())),
+            _ => {}
+        }
+        if self.cfg_spectral_contrast {
+            filters.push(Box::new(SpectralContrastFilter::new()));
+        }
+        if self.cfg_spectral_diff {
+            filters.push(Box::new(SpectralDiffFilter::new()));
+        }
+        if self.cfg_a_weight {
+            filters.push(Box::new(AWeightFilter::new()));
+        }
+        if self.cfg_whitening {
+            filters.push(Box::new(SpectralWhiteningFilter::standard()));
+        }
+
+        self.dsp_chain.set_filters(filters);
+
+        // Mid/side (handled separately, needs stereo input)
+        self.mid_side = match self.cfg_stereo_field.as_str() {
+            "mid"  => Some(MidSideFilter::mid()),
+            "side" => Some(MidSideFilter::side()),
+            _      => None,
+        };
     }
 }
 
@@ -202,7 +307,7 @@ impl Visualizer for WaterfallViz {
                     "display_name": "Frequency Scale",
                     "type": "enum",
                     "value": "log",
-                    "variants": ["linear", "log"]
+                    "variants": ["linear", "log", "mel", "bark"]
                 },
                 {
                     "name": "peak_hold",
@@ -218,6 +323,62 @@ impl Visualizer for WaterfallViz {
                     "type": "enum",
                     "value": "off",
                     "variants": ["off", "on"]
+                },
+                {
+                    "name": "stereo_field",
+                    "display_name": "Stereo Field",
+                    "type": "enum",
+                    "value": "stereo",
+                    "variants": ["stereo", "mid", "side"]
+                },
+                {
+                    "name": "band_filter",
+                    "display_name": "Band Filter",
+                    "type": "enum",
+                    "value": "off",
+                    "variants": ["off", "bass", "mids", "vocal", "presence", "air"]
+                },
+                {
+                    "name": "a_weight",
+                    "display_name": "A-Weight",
+                    "type": "enum",
+                    "value": "off",
+                    "variants": ["off", "on"]
+                },
+                {
+                    "name": "whitening",
+                    "display_name": "Spectral Whitening",
+                    "type": "enum",
+                    "value": "off",
+                    "variants": ["off", "on"]
+                },
+                {
+                    "name": "pre_emphasis",
+                    "display_name": "Pre-Emphasis",
+                    "type": "enum",
+                    "value": "off",
+                    "variants": ["off", "on"]
+                },
+                {
+                    "name": "spectral_diff",
+                    "display_name": "Spectral Diff",
+                    "type": "enum",
+                    "value": "off",
+                    "variants": ["off", "on"]
+                },
+                {
+                    "name": "spectral_contrast",
+                    "display_name": "Spectral Contrast",
+                    "type": "enum",
+                    "value": "off",
+                    "variants": ["off", "on"]
+                },
+                {
+                    "name": "hpss",
+                    "display_name": "HPSS",
+                    "type": "enum",
+                    "value": "off",
+                    "variants": ["off", "harmonic", "percussive"]
                 }
             ]
         }).to_string()
@@ -255,10 +416,41 @@ impl Visualizer for WaterfallViz {
                     "freq_axis" => {
                         self.freq_axis = entry["value"].as_str() == Some("on");
                     }
+                    "stereo_field" => {
+                        if let Some(s) = entry["value"].as_str() {
+                            self.cfg_stereo_field = s.to_string();
+                        }
+                    }
+                    "band_filter" => {
+                        if let Some(s) = entry["value"].as_str() {
+                            self.cfg_band_filter = s.to_string();
+                        }
+                    }
+                    "a_weight" => {
+                        self.cfg_a_weight = entry["value"].as_str() == Some("on");
+                    }
+                    "whitening" => {
+                        self.cfg_whitening = entry["value"].as_str() == Some("on");
+                    }
+                    "pre_emphasis" => {
+                        self.cfg_pre_emphasis = entry["value"].as_str() == Some("on");
+                    }
+                    "spectral_diff" => {
+                        self.cfg_spectral_diff = entry["value"].as_str() == Some("on");
+                    }
+                    "spectral_contrast" => {
+                        self.cfg_spectral_contrast = entry["value"].as_str() == Some("on");
+                    }
+                    "hpss" => {
+                        if let Some(s) = entry["value"].as_str() {
+                            self.cfg_hpss = s.to_string();
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+        self.rebuild_dsp_chain();
         Ok(merged)
     }
 
@@ -273,14 +465,29 @@ impl Visualizer for WaterfallViz {
         let cols = size.cols as usize;
         self.ensure_buffers(rows, cols);
 
-        let fft     = &audio.fft;
+        // ── DSP filter pipeline ───────────────────────────────────────────
+        let fft: Vec<f32>;
+        if !self.dsp_chain.is_empty() || self.mid_side.is_some() {
+            let mut work_samples = match &self.mid_side {
+                Some(ms) => ms.extract(&audio.left, &audio.right),
+                None     => audio.mono.clone(),
+            };
+            let mut work_fft = audio.fft.clone();
+            self.dsp_chain.apply(
+                &mut work_samples, &mut work_fft,
+                audio.sample_rate, FFT_SIZE,
+            );
+            fft = work_fft;
+        } else {
+            fft = audio.fft.clone();
+        }
         let n_bins  = fft.len();
-        let log     = self.frequency_scale == "log";
+        let scale   = self.frequency_scale.as_str();
 
         // Build one row of frac values
         let new_row: Vec<f32> = (0..cols)
             .map(|c| {
-                let bin = Self::col_to_bin(c, cols, n_bins, log);
+                let bin = Self::col_to_bin(c, cols, n_bins, scale);
                 (mag_to_frac(fft[bin]) * self.gain).min(1.0)
             })
             .collect();

@@ -15,6 +15,7 @@
 ///      g. Sleep to target FPS_TARGET frames per second.
 
 mod beat;
+mod dsp;
 mod visualizer;
 #[allow(dead_code)]
 mod visualizer_utils;
