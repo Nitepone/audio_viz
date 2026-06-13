@@ -99,6 +99,9 @@ pub struct BeatDetector {
     // Per-band state
     prev_band_energy: Vec<f32>,
     band_onsets: Vec<f32>,
+    /// `false` until the first frame's energies have been captured, so the
+    /// startup flux spike (every band jumps from 0) cannot fire a phantom beat.
+    primed: bool,
 
     // Adaptive threshold
     onset_avg: f32,
@@ -132,6 +135,7 @@ impl BeatDetector {
             band_bins: Vec::new(), // computed lazily on first update
             prev_band_energy: vec![0.0; n_bands],
             band_onsets: vec![0.0; n_bands],
+            primed: false,
 
             onset_avg: 0.0,
             time_since_beat: 1.0, // start "ready" so first beat can fire
@@ -154,13 +158,17 @@ impl BeatDetector {
             return;
         }
 
-        // Lazily compute bin ranges on first call (or if FFT size changed)
-        if self.band_bins.len() != self.bands.len() {
+        // Lazily compute bin ranges on first call (or if FFT size changed).
+        // A size change also re-primes so the post-resize flux jump is ignored.
+        if self.band_bins.len() != self.bands.len()
+            || self.band_bins.last().map_or(false, |&(_, hi)| hi > n_bins)
+        {
             self.band_bins = self.bands.iter().map(|b| {
                 let lo = freq_to_bin(b.lo_hz, n_bins);
                 let hi = freq_to_bin(b.hi_hz, n_bins).max(lo + 1);
                 (lo, hi.min(n_bins))
             }).collect();
+            self.primed = false;
         }
 
         // ── Sub-band spectral flux ──────────────────────────────────────
@@ -174,9 +182,25 @@ impl BeatDetector {
             self.prev_band_energy[i] = energy;
         }
 
+        // On the first frame after (re)initialisation every band steps up from
+        // a stored energy of 0, producing a full-scale flux spike. Swallow it
+        // so neither a phantom beat nor a corrupted threshold can result.
+        if !self.primed {
+            self.primed = true;
+            for o in self.band_onsets.iter_mut() {
+                *o = 0.0;
+            }
+            onset = 0.0;
+        }
+
         // ── Adaptive threshold ──────────────────────────────────────────
-        let alpha = self.avg_alpha;
-        self.onset_avg = alpha * self.onset_avg + (1.0 - alpha) * onset;
+        // EMA of the onset envelope. `avg_alpha` is the weight of the *new*
+        // sample, so a small alpha means slow adaptation / a stable threshold,
+        // matching the documented behaviour. (A previous revision had these
+        // weights inverted, which pinned the threshold to ~0.9× the current
+        // onset and made `onset > threshold` impossible at sensitivity ≤ 1.35.)
+        let alpha = self.avg_alpha.clamp(0.0, 1.0);
+        self.onset_avg = (1.0 - alpha) * self.onset_avg + alpha * onset;
 
         let threshold = self.onset_avg * (1.5 / self.sensitivity.max(0.01));
 
@@ -283,43 +307,66 @@ fn estimate_bpm(history: &VecDeque<f32>, dt: f32) -> f32 {
 
     let fps = 1.0 / dt;
     // Lag range: 60 BPM → fps frames/beat, 200 BPM → fps*60/200 frames/beat
-    let lag_min = (fps * 60.0 / 200.0).round() as usize; // ~13 at 45 fps
-    let lag_max = (fps * 60.0 / 60.0).round() as usize;  // ~45 at 45 fps
-    let lag_max = lag_max.min(n / 2);
+    let lag_min = (fps * 60.0 / 200.0).round().max(1.0) as usize; // ~14 at 45 fps
+    let lag_max = ((fps * 60.0 / 60.0).round() as usize).min(n / 2); // ~45 at 45 fps
 
     if lag_min >= lag_max {
         return 0.0;
     }
 
-    // Compute mean for zero-centering
+    // Copy into a contiguous, zero-centred buffer. Working on a slice avoids
+    // repeated ring-buffer index arithmetic in the O(n·lags) inner loop, and
+    // the zero-lag energy gives us a normaliser for a true correlation coeff.
     let mean = history.iter().sum::<f32>() / n as f32;
+    let buf: Vec<f32> = history.iter().map(|&v| v - mean).collect();
+    let energy: f32 = buf.iter().map(|&v| v * v).sum();
+    if energy <= 1e-12 {
+        return 0.0;
+    }
 
     let mut best_lag = 0usize;
     let mut best_corr = f32::NEG_INFINITY;
+    // Retain per-lag scores for sub-frame parabolic interpolation of the peak.
+    let mut scores = vec![f32::NEG_INFINITY; lag_max + 1];
 
     for lag in lag_min..=lag_max {
         let mut corr = 0.0f32;
-        let samples = n - lag;
-        for i in 0..samples {
-            corr += (history[i] - mean) * (history[i + lag] - mean);
+        for i in 0..(n - lag) {
+            corr += buf[i] * buf[i + lag];
         }
-        corr /= samples as f32;
+        // Biased autocorrelation (divide by the constant zero-lag energy, not
+        // by the per-lag overlap) → a coefficient in [-1, 1] that tapers
+        // spurious long-lag peaks instead of inflating them.
+        corr /= energy;
 
-        // Weight toward ~120 BPM (perceptual center of musical tempo range)
+        // Weight toward ~120 BPM (perceptual centre of the musical tempo range)
         let bpm_at_lag = fps * 60.0 / lag as f32;
         let center_weight = 1.0 - ((bpm_at_lag - 120.0) / 120.0).abs() * 0.15;
         corr *= center_weight;
 
+        scores[lag] = corr;
         if corr > best_corr {
             best_corr = corr;
             best_lag = lag;
         }
     }
 
-    if best_lag == 0 || best_corr <= 0.0 {
+    // Require a minimum periodicity strength so noise doesn't report a tempo.
+    if best_lag == 0 || best_corr < 0.10 {
         return 0.0;
     }
 
-    let bpm = fps * 60.0 / best_lag as f32;
-    bpm
+    // Parabolic interpolation around the peak for sub-frame lag precision,
+    // which removes the BPM quantisation imposed by the integer frame rate.
+    let mut lag = best_lag as f32;
+    if best_lag > lag_min && best_lag < lag_max {
+        let (y0, y1, y2) = (scores[best_lag - 1], scores[best_lag], scores[best_lag + 1]);
+        let denom = y0 - 2.0 * y1 + y2;
+        if denom.abs() > 1e-9 {
+            lag += (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
+        }
+    }
+
+    fps * 60.0 / lag
 }
+
