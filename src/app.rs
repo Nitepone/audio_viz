@@ -22,7 +22,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::audio::{AudioCapture, FftEngine};
+use crate::audio::{self, AudioCapture, FftEngine};
 use crate::beat::{BeatDetector, BeatDetectorConfig};
 use crate::config;
 use crate::dsp::rms;
@@ -63,6 +63,7 @@ pub struct App {
     /// The active visualizer, wrapped in the post-effect config layer.
     viz: FxViz,
     capture: AudioCapture,
+    host: cpal::Host,
     fft: FftEngine,
     beat: BeatDetector,
 
@@ -79,7 +80,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(viz: Box<dyn Visualizer>, capture: AudioCapture, fps_cap: f32) -> Self {
+    pub fn new(
+        viz: Box<dyn Visualizer>,
+        capture: AudioCapture,
+        fps_cap: f32,
+        host: cpal::Host,
+    ) -> Self {
         // Wrap before loading the saved config so persisted fx_* entries
         // reach the wrapper instead of being dropped by the inner schema.
         let mut viz = FxViz::new(viz);
@@ -88,6 +94,7 @@ impl App {
         Self {
             viz,
             capture,
+            host,
             fft: FftEngine::new(),
             beat: BeatDetector::new(BeatDetectorConfig::standard()),
             window: None,
@@ -153,6 +160,14 @@ impl App {
                         ui.set_active_viz(self.viz.name(), &cleaned);
                     }
                 }
+                UiAction::SwitchDevice(name) => match audio::start_capture(&self.host, Some(name))
+                {
+                    Ok(new_capture) => {
+                        ui.set_current_device(&new_capture.device_name);
+                        self.capture = new_capture;
+                    }
+                    Err(e) => eprintln!("[audio error] failed to switch device: {e}"),
+                },
             }
         }
 
@@ -246,8 +261,15 @@ impl ApplicationHandler for App {
             gpu.set_shader(fragment_wgsl);
         }
 
-        let mut ui =
-            PanelUi::new(&window, gpu.device(), gpu.surface_format(), build_categories());
+        let devices = audio::list_devices(&self.host).unwrap_or_default();
+        let mut ui = PanelUi::new(
+            &window,
+            gpu.device(),
+            gpu.surface_format(),
+            build_categories(),
+            devices,
+            self.capture.device_name.clone(),
+        );
         ui.set_active_viz(self.viz.name(), &config::live_config(&self.viz));
 
         let (w, h) = gpu.surface_size();

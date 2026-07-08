@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Run the windowed app ──────────────────────────────────────────────────
     let event_loop = EventLoop::new()?;
-    let mut app = app::App::new(viz, capture, cli.fps);
+    let mut app = app::App::new(viz, capture, cli.fps, host);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

@@ -27,6 +27,8 @@ pub enum UiAction {
     ApplyConfig(String),
     /// Restore the active visualizer's default config and persist.
     ResetConfig,
+    /// Switch audio capture to the named input device.
+    SwitchDevice(String),
 }
 
 // ── Generated settings model ─────────────────────────────────────────────────
@@ -98,6 +100,11 @@ pub struct PanelUi {
     entries: Vec<ConfigEntry>,
     viz_name: String,
 
+    /// Available audio input device names — built once at startup.
+    devices: Vec<String>,
+    /// Name of the device currently capturing.
+    current_device: String,
+
     /// Central (render pane) rect in egui points, captured during build.
     central_points: egui::Rect,
 }
@@ -118,6 +125,8 @@ impl PanelUi {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         categories: Vec<(String, Vec<(String, String)>)>,
+        devices: Vec<String>,
+        current_device: String,
     ) -> Self {
         let ctx = egui::Context::default();
         let state = egui_winit::State::new(
@@ -139,8 +148,16 @@ impl PanelUi {
             categories,
             entries: Vec::new(),
             viz_name: String::new(),
+            devices,
+            current_device,
             central_points: egui::Rect::NOTHING,
         }
+    }
+
+    /// Update the displayed current device (e.g. after a switch resolves to
+    /// a specific device name).
+    pub fn set_current_device(&mut self, name: &str) {
+        self.current_device = name.to_string();
     }
 
     /// Load the settings model for a (newly activated) visualizer from its
@@ -217,6 +234,25 @@ impl PanelUi {
                             }
                         });
                     });
+                    ui.separator();
+                    ui.label(egui::RichText::new("Audio Device").strong().small());
+                    {
+                        let mut current = self.current_device.clone();
+                        egui::ComboBox::from_id_salt("audio-device")
+                            .selected_text(current.clone())
+                            .width(190.0)
+                            .show_ui(ui, |ui| {
+                                for dev in &self.devices {
+                                    if ui
+                                        .selectable_value(&mut current, dev.clone(), dev)
+                                        .changed()
+                                    {
+                                        actions.push(UiAction::SwitchDevice(dev.clone()));
+                                    }
+                                }
+                            });
+                        self.current_device = current;
+                    }
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (cat, vizs) in &self.categories {
