@@ -51,6 +51,23 @@ fn prev_pixel(uv: vec2<f32>) -> vec4<f32> {
     return textureSample(prev_frame, tex_sampler, uv);
 }
 
+// Phosphor fade for feedback persistence.  Pure exponential decay
+// (`prev * persistence^dt`) has a constant relative rate, so faint trails
+// linger asymptotically.  Here the rate grows as the trace dims — decay is
+// exponential in log-brightness — so bright cores hold close to the
+// configured persistence while dim ghosts collapse quickly, ending in a
+// hard snap to black.  `persistence` is the fraction retained per second
+// at full brightness (4.0, the engine's clamp ceiling).
+fn phosphor_fade(prev: vec3<f32>, persistence: f32, dt: f32) -> vec3<f32> {
+    let lum = max(max(prev.r, prev.g), prev.b);
+    if (lum < 0.004) {
+        return vec3<f32>(0.0);
+    }
+    let base = pow(clamp(persistence, 0.001, 0.999), dt);
+    let tail = pow(clamp(lum * 0.25, 1e-4, 1.0), 0.9 * dt);
+    return prev * base * tail;
+}
+
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,   // 0..1, y increases downward

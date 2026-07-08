@@ -9,10 +9,19 @@ the reference for behaviour, config schemas, and DSP.
 ## Inventory (audio-viz-tui/src/visualizers/)
 
 - **frequency/**: spectrum (bar analyzer), radial, vu
-- **scopes/**: lissajous (the "modern" variant), polar
+- **scopes/**: lissajous (the "modern" variant); ~~polar~~ (ported natively 2026-07)
 - **effects/**: aurora, fire, matrix, missiles, night_sky, plasma, ripple,
   tempest, tunnel
 - **abstract/**: attractor, crystal, orbit, pulsar
+
+## Quick path: run the original via the terminal render layer
+
+`src/term/` + `src/visualizers/tui/` (see CLAUDE.md → "Installing a TUI
+visualizer") can run any terminal visualizer **unmodified** — ANSI cells
+rasterised with a configurable font — as done for `tempest`. Use it to get a
+visualizer into the app immediately, or when the ASCII aesthetic *is* the
+point; a native pixel/GPU recreation per the guidance below can still replace
+it later (remove the `src/visualizers/tui/<name>.rs` wrapper when it does).
 
 ## Guidance
 

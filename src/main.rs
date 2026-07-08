@@ -12,8 +12,11 @@ mod audio;
 mod beat;
 mod config;
 mod dsp;
+mod fx;
 mod gpu;
 mod palette;
+mod term;
+mod tui;
 mod ui;
 mod visualizer;
 mod visualizers;
@@ -74,7 +77,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Select visualizer ─────────────────────────────────────────────────────
     let viz_name = cli.visualizer.to_lowercase();
-    let mut viz: Box<dyn Visualizer> = {
+    let viz: Box<dyn Visualizer> = {
         let all = visualizers::all_visualizers();
         let names: Vec<String> = all.iter().map(|v| v.name().to_string()).collect();
         match all.into_iter().find(|v| v.name() == viz_name) {
@@ -86,7 +89,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
     };
-    config::load_and_apply_config(&mut viz);
+    // Saved config is loaded in App::new, after the post-effect wrapper is
+    // applied, so persisted fx_* entries reach the wrapper.
 
     // ── Audio capture ─────────────────────────────────────────────────────────
     let capture = audio::start_capture(&host, cli.device.as_deref())?;

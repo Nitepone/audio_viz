@@ -38,7 +38,7 @@ pub fn config_path(name: &str) -> std::path::PathBuf {
 /// Load saved config for the active visualizer, apply it, and write back the
 /// merged/cleaned version.  Silently ignores I/O or parse errors so a corrupt
 /// file never prevents startup.
-pub fn load_and_apply_config(viz: &mut Box<dyn Visualizer>) {
+pub fn load_and_apply_config(viz: &mut dyn Visualizer) {
     let path = config_path(viz.name());
     let saved = match std::fs::read_to_string(&path) {
         Ok(s) => s,

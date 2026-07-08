@@ -37,7 +37,7 @@ fn trace_intensity(row: i32, p_px: vec2<f32>, n_show: f32, gain: f32,
         d2_min = min(d2_min, d2);
     }
     let core = exp(-d2_min / (thickness * thickness));
-    let gw   = thickness * 6.0;
+    let gw   = thickness * 3.0;
     let glow = exp(-d2_min / (gw * gw));
     return vec2<f32>(core, glow);
 }
@@ -60,7 +60,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     if (mono) {
         let t = trace_intensity(ROW_MONO, p_px, n_show, gain, 0.0, res.y, thickness);
-        col = cyan * (t.x * 1.1 + t.y * 0.18) + vec3<f32>(1.0) * t.x * t.x * 0.35;
+        col = cyan * (t.x * 1.1 + t.y * 0.08) + vec3<f32>(1.0) * t.x * t.x * 0.2;
         center_y = 0.5 * res.y;
         // Zero line
         let dz = abs(p_px.y - center_y);
@@ -69,8 +69,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let half_h = 0.5 * res.y;
         let lt = trace_intensity(ROW_LEFT, p_px, n_show, gain, 0.0, half_h, thickness);
         let rt = trace_intensity(ROW_RIGHT, p_px, n_show, gain, half_h, half_h, thickness);
-        col = cyan   * (lt.x * 1.1 + lt.y * 0.18) + vec3<f32>(1.0) * lt.x * lt.x * 0.35
-            + orange * (rt.x * 1.1 + rt.y * 0.18) + vec3<f32>(1.0) * rt.x * rt.x * 0.35;
+        col = cyan   * (lt.x * 1.1 + lt.y * 0.08) + vec3<f32>(1.0) * lt.x * lt.x * 0.2
+            + orange * (rt.x * 1.1 + rt.y * 0.08) + vec3<f32>(1.0) * rt.x * rt.x * 0.2;
 
         // Zero lines for each panel + separator between panels.
         let dz_l = abs(p_px.y - 0.25 * res.y);
@@ -81,8 +81,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                   + vec3<f32>(0.5) * exp(-dsep * dsep / 0.5) * 0.10;
     }
 
-    // Faint trail from the previous frame.
-    let trail = prev_pixel(in.uv).rgb * pow(TRAIL, u.dt);
+    // Faint trail from the previous frame; phosphor_fade (prelude.wgsl)
+    // accelerates the decay as it dims so ghosts clear quickly.
+    let trail = phosphor_fade(prev_pixel(in.uv).rgb, TRAIL, u.dt);
     col = max(col, trail);
 
     return vec4<f32>(min(col, vec3<f32>(4.0)), 1.0);

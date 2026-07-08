@@ -35,7 +35,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Beam width in square-space units (focus 1.0 ≈ 2.5 px on a 1080p target).
     let sigma      = focus * 5.0 / half;
-    let glow_sigma = sigma * 6.0;
+    let glow_sigma = sigma * 3.0;
 
     // ── Accumulate beam energy over the sample path ────────────────────────
     let stride = AUDIO_SAMPLES / N_POINTS;
@@ -69,20 +69,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let base = beam_color(theme);
     // White-hot core on strong deposits, coloured halo around it.
-    let deposit = base * (energy * 3.0 + glow * 0.35)
-                + vec3<f32>(1.0, 1.0, 1.0) * energy * energy * 0.8;
+    let deposit = base * (energy * 3.0 + glow * 0.08)
+                + vec3<f32>(1.0, 1.0, 1.0) * energy * energy * 0.4;
 
     // ── Phosphor persistence via feedback ──────────────────────────────────
-    let decay = pow(persistence, u.dt);
-    let prev  = prev_pixel(in.uv).rgb * decay;
+    // max() model: fresh deposits stamp at their true brightness and the
+    // previous frame only fades.  Additive feedback (prev + deposit) would
+    // amplify any slow-moving trace to deposit/(1-decay) — tens of times
+    // over — which read as runaway bloom.  phosphor_fade (prelude.wgsl)
+    // accelerates the decay as the trace dims, killing faint ghosts fast.
+    let prev = phosphor_fade(prev_pixel(in.uv).rgb, persistence, u.dt);
 
-    // Dim crosshair, injected with (1 - decay) compensation so its steady
-    // state brightness is frame-rate independent.
+    // Dim crosshair.
     let axis_w = 1.5 / half;
     let axis = (exp(-sq.y * sq.y / (axis_w * axis_w))
               + exp(-sq.x * sq.x / (axis_w * axis_w))) * 0.05;
     let floor_light = base * axis;
 
-    let col = max(prev + floor_light * (1.0 - decay), vec3<f32>(0.0)) + deposit;
+    let col = max(prev, deposit + floor_light);
     return vec4<f32>(min(col, vec3<f32>(4.0)), 1.0);
 }

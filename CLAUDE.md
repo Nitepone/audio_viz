@@ -42,15 +42,29 @@ src/
 ├── palette.rs         RGB gradient palettes (heat/ice/spectrum/mono/phosphor)
 ├── ui.rs              egui overlay: left visualizer-picker panel, right
 │                      settings panel (generated from config JSON schemas)
+├── fx.rs              post-effect registry (EFFECTS table) + FxViz wrapper
+│                      that appends fx toggles/sliders to every viz's schema
+├── term/              terminal render layer (TUI → windowed bridge)
+│   ├── mod.rs         TermViz adapter: TUI trait → software Visualizer;
+│   │                  injects Font / Font Size / Show Status Bar settings
+│   ├── ansi.rs        SGR escape parser → character-cell grid
+│   └── font.rs        fontdue glyph cache over embedded assets/fonts/;
+│                      block/shade/braille chars drawn geometrically
+├── tui/               vendored TUI compat runtime (from audio-viz-tui/src/)
+│   ├── visualizer.rs        TUI Visualizer trait, TermSize, status_bar, …
+│   └── visualizer_utils.rs  TUI DSP helpers + ANSI palettes
 ├── gpu/
 │   ├── mod.rs         GpuContext: surface, uniform buffer, audio texture,
-│   │                  ping-pong feedback textures, blit pipeline
+│   │                  ping-pong feedback textures, blit + post-fx pipelines
 │   ├── prelude.wgsl   prepended to every shader visualizer — binding contract
-│   └── blit.wgsl      offscreen/software texture → swapchain
+│   ├── blit.wgsl      offscreen/software texture → swapchain
+│   ├── fx_prelude.wgsl  prepended to every post effect — binding contract
+│   └── fx/            post-effect fragment shaders: crt.wgsl
 └── visualizers/
     ├── mod.rs         include!(OUT_DIR/registry.rs)
     ├── frequency/     spectrogram.rs            (software)
-    └── scopes/        classic_lissajous.{rs,wgsl}, scope.{rs,wgsl}  (shader)
+    ├── scopes/        classic_lissajous, polar, scope  .{rs,wgsl}   (shader)
+    └── tui/           installed TUI visualizers: tempest.rs  (software)
 ```
 
 ## Build & Test
@@ -98,6 +112,53 @@ pub trait Visualizer: Send {
   `shader_params()` (delivered as `u.params`, four vec4s).
 - Config JSON schema is identical to the terminal app (`float`, `int`, `enum`,
   `bool` entries; merge via `config::merge_config`).
+
+### Installing a TUI visualizer (src/visualizers/tui/)
+
+Visualizers from the legacy terminal app run unmodified through the terminal
+render layer (`src/term/`): the `TermViz` adapter sizes a virtual terminal
+from the pane's pixel size and the configured font, ticks the TUI visualizer,
+parses its ANSI output, and rasterises the cell grid into a software
+framebuffer. Font family, font size, and a status-bar toggle are appended to
+the wrapped visualizer's settings automatically — never add them by hand.
+
+To install one (see `tempest.rs` for the reference example):
+
+1. Copy `audio-viz-tui/src/visualizers/<cat>/<name>.rs` to
+   `src/visualizers/tui/<name>.rs`. The filename must equal the visualizer's
+   `name()`, and must not collide with any existing visualizer.
+2. Rewrite the imports — everything else stays verbatim:
+   - `crate::visualizer::…` → `crate::tui::visualizer::…`
+   - `crate::visualizer_utils::…` → `crate::tui::visualizer_utils::…`
+   - `crate::beat::…` stays as-is (identical library)
+3. Replace the `register()` body:
+   ```rust
+   pub fn register() -> Vec<Box<dyn crate::visualizer::Visualizer>> {
+       crate::term::TermViz::adapt(vec![Box::new(MyViz::new(""))])
+   }
+   ```
+
+`src/tui/` holds vendored copies of the TUI crate's `visualizer.rs` and
+`visualizer_utils.rs` (import paths adjusted, otherwise in sync with
+`audio-viz-tui/src/`). Fonts are embedded from `assets/fonts/` (DejaVu Sans
+Mono + Fira Code, regular/bold); block, shade, and braille characters are
+drawn geometrically in `src/term/font.rs` so cells tile without seams.
+
+## Post Effects (src/fx.rs + src/gpu/fx/)
+
+Screen-space effects (e.g. CRT) applied after the visualizer renders — they
+stack in a chain that ends at the swapchain blit, with the final pass running
+at display resolution inside the viz rect. They work on top of every
+visualizer: shader, software, and terminal-rendered. The `FxViz` wrapper
+(applied to every visualizer by app.rs) appends each effect's on/off toggle
+and parameter sliders to the visualizer's settings schema, so UI and per-viz
+persistence are automatic (config names: `fx_<effect>` / `fx_<effect>_<param>`).
+
+To add an effect: create `src/gpu/fx/<name>.wgsl` (fragment only — see
+`fx_prelude.wgsl` for bindings: `src` texture, `fx.resolution`, `fx.time`,
+`fx.params`) and add a row to `EFFECTS` in `src/fx.rs` (max 8 params).
+Nothing else: pipelines, settings UI, and persistence are table-driven.
+Launch once after editing a `.wgsl` — naga errors panic at startup.
 
 ### Shader binding contract (src/gpu/prelude.wgsl)
 

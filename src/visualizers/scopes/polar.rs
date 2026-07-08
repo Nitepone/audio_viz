@@ -1,16 +1,23 @@
-/// classic_lissajous.rs — Classic XY phosphor oscilloscope (GPU shader).
+/// polar.rs — Polar waveform oscilloscope (GPU shader).
 ///
-/// Left channel drives X, right channel drives Y.  The WGSL fragment shader
-/// (classic_lissajous.wgsl) draws the beam as an analytic line — for every
-/// pixel it accumulates Gaussian falloff from each consecutive sample-pair
-/// segment, weighted by beam speed so slow beam passages glow brighter, just
-/// like a real CRT.  Persistence comes from the engine's feedback texture:
-/// each frame decays the previous frame instead of clearing it.
+/// The mono waveform is bent into a circle: time maps to angle (one audio
+/// window per revolution) and amplitude modulates the radius outward from a
+/// base ring — silence draws a perfect circle, loud signals push the
+/// perimeter in and out in rhythmic pulses.  The WGSL fragment shader
+/// (polar.wgsl) draws the beam analytically with the same phosphor model as
+/// classic_lissajous (dwell-weighted Gaussian deposits, feedback-texture
+/// persistence).  A dim reference ring marks the zero-amplitude radius so
+/// the deformation is always visible even at low gain.
+///
+/// Native port of the terminal app's `polar` visualizer; its config schema
+/// (gain / base_radius / theme) is kept verbatim, with the scope family's
+/// persistence and focus settings added.
 ///
 /// This file is only the config wrapper; all drawing lives in the .wgsl.
 ///
 /// Config:
-///   gain        — amplitude multiplier applied to both channels
+///   gain        — amplitude multiplier before radius modulation
+///   base_radius — zero-amplitude ring radius, fraction of the usable radius
 ///   persistence — fraction of phosphor brightness retained per second
 ///   theme       — phosphor color: green (P31) / amber (P3) / white (P4)
 ///   focus       — beam width (lower = sharper trace)
@@ -19,18 +26,25 @@ use crate::config::merge_config;
 use crate::visualizer::{AudioFrame, PixelSize, RenderMode, Visualizer};
 
 const CONFIG_VERSION: u64 = 1;
-const FRAGMENT_WGSL: &str = include_str!("classic_lissajous.wgsl");
+const FRAGMENT_WGSL: &str = include_str!("polar.wgsl");
 
-pub struct ClassicLissajousViz {
+pub struct PolarViz {
     gain: f32,
+    base_radius: f32,
     persistence: f32,
     theme: String,
     focus: f32,
 }
 
-impl ClassicLissajousViz {
+impl PolarViz {
     pub fn new() -> Self {
-        Self { gain: 1.0, persistence: 0.5, theme: "green".to_string(), focus: 1.0 }
+        Self {
+            gain: 1.0,
+            base_radius: 0.55,
+            persistence: 0.5,
+            theme: "green".to_string(),
+            focus: 1.0,
+        }
     }
 
     fn theme_index(&self) -> f32 {
@@ -42,12 +56,12 @@ impl ClassicLissajousViz {
     }
 }
 
-impl Visualizer for ClassicLissajousViz {
+impl Visualizer for PolarViz {
     fn name(&self) -> &str {
-        "classic_lissajous"
+        "polar"
     }
     fn description(&self) -> &str {
-        "Classic XY phosphor oscilloscope — Lissajous figure (GPU shader)"
+        "Polar waveform — circular oscilloscope (GPU shader)"
     }
     fn mode(&self) -> RenderMode {
         RenderMode::Shader { fragment_wgsl: FRAGMENT_WGSL }
@@ -64,12 +78,13 @@ impl Visualizer for ClassicLissajousViz {
         p[1] = self.persistence;
         p[2] = self.theme_index();
         p[3] = self.focus;
+        p[4] = self.base_radius;
         p
     }
 
     fn get_default_config(&self) -> String {
         serde_json::json!({
-            "visualizer_name": "classic_lissajous",
+            "visualizer_name": "polar",
             "version": CONFIG_VERSION,
             "config": [
                 {
@@ -79,6 +94,14 @@ impl Visualizer for ClassicLissajousViz {
                     "value": 1.0,
                     "min": 0.1,
                     "max": 4.0
+                },
+                {
+                    "name": "base_radius",
+                    "display_name": "Base Radius",
+                    "type": "float",
+                    "value": 0.55,
+                    "min": 0.2,
+                    "max": 0.9
                 },
                 {
                     "name": "persistence",
@@ -116,6 +139,9 @@ impl Visualizer for ClassicLissajousViz {
             for entry in config {
                 match entry["name"].as_str().unwrap_or("") {
                     "gain" => self.gain = entry["value"].as_f64().unwrap_or(1.0) as f32,
+                    "base_radius" => {
+                        self.base_radius = entry["value"].as_f64().unwrap_or(0.55) as f32
+                    }
                     "persistence" => {
                         self.persistence = entry["value"].as_f64().unwrap_or(0.5) as f32
                     }
@@ -132,5 +158,5 @@ impl Visualizer for ClassicLissajousViz {
 }
 
 pub fn register() -> Vec<Box<dyn Visualizer>> {
-    vec![Box::new(ClassicLissajousViz::new())]
+    vec![Box::new(PolarViz::new())]
 }

@@ -26,6 +26,7 @@ use crate::audio::{AudioCapture, FftEngine};
 use crate::beat::{BeatDetector, BeatDetectorConfig};
 use crate::config;
 use crate::dsp::rms;
+use crate::fx::FxViz;
 use crate::gpu::{AudioTexData, GpuContext, Uniforms};
 use crate::ui::{PanelUi, UiAction};
 use crate::visualizer::{PixelSize, RenderMode, Visualizer, SAMPLE_RATE};
@@ -59,7 +60,8 @@ fn build_categories() -> Vec<(String, Vec<(String, String)>)> {
 }
 
 pub struct App {
-    viz: Box<dyn Visualizer>,
+    /// The active visualizer, wrapped in the post-effect config layer.
+    viz: FxViz,
     capture: AudioCapture,
     fft: FftEngine,
     beat: BeatDetector,
@@ -78,6 +80,10 @@ pub struct App {
 
 impl App {
     pub fn new(viz: Box<dyn Visualizer>, capture: AudioCapture, fps_cap: f32) -> Self {
+        // Wrap before loading the saved config so persisted fx_* entries
+        // reach the wrapper instead of being dropped by the inner schema.
+        let mut viz = FxViz::new(viz);
+        config::load_and_apply_config(&mut viz);
         let now = Instant::now();
         Self {
             viz,
@@ -125,12 +131,13 @@ impl App {
         for action in &ui_frame.actions {
             match action {
                 UiAction::SwitchViz(name) => {
-                    if let Some(mut new_viz) = make_viz(name) {
+                    if let Some(inner) = make_viz(name) {
+                        let mut new_viz = FxViz::new(inner);
                         config::load_and_apply_config(&mut new_viz);
                         if let RenderMode::Shader { fragment_wgsl } = new_viz.mode() {
                             gpu.set_shader(fragment_wgsl);
                         }
-                        ui.set_active_viz(new_viz.name(), &config::live_config(new_viz.as_ref()));
+                        ui.set_active_viz(new_viz.name(), &config::live_config(&new_viz));
                         self.viz = new_viz;
                     }
                 }
@@ -151,6 +158,7 @@ impl App {
 
         let (rx, ry, rw, rh) = ui.central_px(&ui_frame, surface_size);
         gpu.set_viz_rect(rx, ry, rw, rh);
+        gpu.set_post_chain(&self.viz.chain(), (t0 - self.start).as_secs_f32());
 
         let size = match self.viz.mode() {
             RenderMode::Shader { .. } => {
@@ -240,7 +248,7 @@ impl ApplicationHandler for App {
 
         let mut ui =
             PanelUi::new(&window, gpu.device(), gpu.surface_format(), build_categories());
-        ui.set_active_viz(self.viz.name(), &config::live_config(self.viz.as_ref()));
+        ui.set_active_viz(self.viz.name(), &config::live_config(&self.viz));
 
         let (w, h) = gpu.surface_size();
         self.viz.on_resize(PixelSize { width: w, height: h });
@@ -315,5 +323,16 @@ impl ApplicationHandler for App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Tear down GPU and window resources while the event loop (and with it
+    /// the Wayland/X11 display connection) still exists. `run_app` consumes
+    /// the `EventLoop`, so anything left alive in `App` after it returns
+    /// would be destroyed against a dead display connection — a segfault on
+    /// Wayland.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.ui = None;
+        self.gpu = None;
+        self.window = None;
     }
 }
