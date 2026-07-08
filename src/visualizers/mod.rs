@@ -10,35 +10,19 @@
 ///   src/visualizers/
 ///     scopes/     — waveform / oscilloscope visualizers
 ///     frequency/  — frequency-domain / level visualizers
-///     effects/    — generative artistic effects
-///     abstract/   — abstract motion visualizers
 ///
-/// The generated file looks roughly like:
-///
-///   #[path = "/abs/path/frequency/spectrum.rs"]
-///   pub mod spectrum;
-///   // ...
-///
-///   pub fn all_visualizers() -> Vec<Box<dyn Visualizer>> { ... }
-///
-///   pub fn visualizer_categories() -> Vec<(&'static str, Vec<&'static str>)> {
-///       vec![
-///           ("abstract",  vec!["orbit", "pulsar"]),
-///           ("effects",   vec!["fire", "matrix", "plasma"]),
-///           ("frequency", vec!["radial", "spectrum", "vu"]),
-///           ("scopes",    vec!["lissajous", "scope"]),
-///       ]
-///   }
+/// (Add more categories by creating new subdirectories — build.rs picks
+/// them up automatically.)
 ///
 /// To add a new visualizer:
 ///   1. Create src/visualizers/<category>/mything.rs
+///      (plus mything.wgsl beside it if shader-based)
 ///   2. Implement the Visualizer trait
 ///   3. Export:  pub fn register() -> Vec<Box<dyn Visualizer>> { ... }
 ///   4. Run:     cargo build
 ///
-/// The new visualizer appears automatically in --list, the in-app picker,
-/// and is selectable by its basename on the CLI.  No other files need
-/// to be touched.
+/// The new visualizer appears automatically in --list and is selectable
+/// by its basename on the CLI.  No other files need to be touched.
 
 use crate::visualizer::Visualizer;
 

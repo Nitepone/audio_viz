@@ -1,51 +1,33 @@
-[workspace]
-members = [".", "web"]
-resolver = "2"
-
 [package]
-name        = "audio_viz"
+name        = "audio-viz"
 version     = "0.1.0"
-edition     = "2024"
-description = "Multi-mode terminal audio visualizer"
+edition     = "2021"
+description = "2D/3D windowed audio visualizer with GPU-shader and software rendering"
 build       = "build.rs"
 
-[lib]
-name = "audio_viz"
-path = "src/lib.rs"
+# audio-viz-tui/ (the legacy terminal app) is its own workspace and builds
+# independently from inside that directory.
+[workspace]
+members = ["."]
+exclude = ["audio-viz-tui"]
 
 [[bin]]
-name              = "audio_viz"
-path              = "src/main.rs"
-required-features = ["terminal"]
-
-[features]
-# The "terminal" feature pulls in every dependency that doesn't compile on
-# wasm32.  It is enabled by default so that `cargo build` (no flags) still
-# produces the full terminal binary.  The WASM crate depends on this crate
-# without activating it, which keeps crossterm/cpal/clap out of the WASM build.
-default  = ["terminal"]
-terminal = ["dep:crossterm", "dep:cpal", "dep:clap", "dep:anyhow"]
+name = "audio-viz"
+path = "src/main.rs"
 
 [dependencies]
+winit      = "0.30"
+wgpu       = "24"
+egui       = "0.31"
+egui-wgpu  = "0.31"
+egui-winit = "0.31"
+pollster   = "0.4"
+bytemuck   = { version = "1", features = ["derive"] }
+cpal       = { version = "0.15", default-features = false }
 rustfft    = "6"
-rand       = "0.8"
+clap       = { version = "4", features = ["derive"] }
 serde_json = "1"
-
-# Terminal-only dependencies, excluded from the WASM build
-anyhow    = { version = "1.0.102", optional = true }
-crossterm = { version = "0.28", optional = true }
-clap      = { version = "4", features = ["derive"], optional = true }
-
-# cpal: WASAPI on Windows and ALSA/CoreAudio on Linux/macOS are selected
-# automatically by cpal based on the target — no feature flags needed.
-cpal = { version = "0.15", default-features = false, optional = true }
-
-# libc is only used by the Linux stderr silencer
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
-[build-dependencies]
-# build.rs only uses std — no extra deps needed
+anyhow     = "1"
 
 [profile.release]
 opt-level = 3

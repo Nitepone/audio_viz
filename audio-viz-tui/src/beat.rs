@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use crate::dsp::freq_to_bin;
+use crate::visualizer_utils::freq_to_bin;
 
 // ── Band configuration ──────────────────────────────────────────────────────
 

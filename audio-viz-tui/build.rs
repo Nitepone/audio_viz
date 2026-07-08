@@ -18,12 +18,8 @@
 /// (except mod.rs) must export:
 ///   pub fn register() -> Vec<Box<dyn Visualizer>>
 ///
-/// Shader-based visualizers keep their WGSL fragment source in a sibling
-/// .wgsl file (same basename), pulled in by the .rs wrapper with
-/// include_str!.  .wgsl files are ignored by this scan.
-///
 /// To add a new visualizer:
-///   1. Create src/visualizers/<category>/mything.rs (+ mything.wgsl if shader-based)
+///   1. Create src/visualizers/<category>/mything.rs
 ///   2. Implement the Visualizer trait
 ///   3. Export: pub fn register() -> Vec<Box<dyn Visualizer>> { ... }
 ///   4. Run:    cargo build
@@ -31,7 +27,7 @@ use std::fs;
 use std::path::Path;
 
 struct VisModule {
-    /// Module / basename name (e.g. "spectrogram")
+    /// Module / basename name (e.g. "spectrum")
     name: String,
     /// Category directory name (e.g. "frequency")
     category: String,
@@ -49,10 +45,8 @@ fn main() {
     // Scan one level of subdirectories only; skip root .rs files (mod.rs lives there).
     for entry in fs::read_dir(vis_dir).expect("src/visualizers/ must exist") {
         let entry = entry.expect("failed to read entry in src/visualizers/");
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+        let path  = entry.path();
+        if !path.is_dir() { continue; }
 
         let category = path
             .file_name()
@@ -63,11 +57,9 @@ fn main() {
         for sub in fs::read_dir(&path)
             .unwrap_or_else(|_| panic!("failed to read src/visualizers/{}/", category))
         {
-            let sub = sub.expect("failed to read sub-entry");
+            let sub  = sub.expect("failed to read sub-entry");
             let name = sub.file_name().into_string().expect("non-UTF-8 filename");
-            if !name.ends_with(".rs") || name == "mod.rs" {
-                continue;
-            }
+            if !name.ends_with(".rs") || name == "mod.rs" { continue; }
 
             let mod_name = name.trim_end_matches(".rs").to_string();
             let abs_path = src_dir
@@ -84,12 +76,19 @@ fn main() {
     modules.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
-    let dest = Path::new(&out_dir).join("registry.rs");
+    let dest    = Path::new(&out_dir).join("registry.rs");
     let mut code = String::new();
 
     // ── Module declarations ────────────────────────────────────────────────────
+    //
+    // Each `pub mod foo;` uses a `#[path]` attribute pointing to the real
+    // source file so rustc can find it from OUT_DIR.  `pub` is required so
+    // main.rs can reach e.g. `visualizers::spectrum::SpectrumViz`.
     for m in &modules {
-        code.push_str(&format!("#[path = \"{}\"]\npub mod {};\n", m.abs_path, m.name));
+        code.push_str(&format!(
+            "#[path = \"{}\"]\npub mod {};\n",
+            m.abs_path, m.name
+        ));
     }
     code.push('\n');
 
@@ -106,13 +105,16 @@ fn main() {
     code.push_str("    out\n}\n\n");
 
     // ── visualizer_categories() ───────────────────────────────────────────────
+    //
+    // Returns (category_name, [visualizer_name, ...]) pairs in sorted order.
+    // Used by the in-app picker for the two-level category → visualizer menu.
     code.push_str(
         "/// Return visualizer names grouped by category, both sorted alphabetically.\n\
-         #[allow(dead_code)]\n\
          pub fn visualizer_categories() -> Vec<(&'static str, Vec<&'static str>)> {\n\
              vec![\n",
     );
 
+    // Collect unique categories in sorted order.
     let mut categories: Vec<&str> = Vec::new();
     for m in &modules {
         if !categories.contains(&m.category.as_str()) {
@@ -129,9 +131,7 @@ fn main() {
 
         code.push_str(&format!("        (\"{}\", vec![", cat));
         for (i, n) in names.iter().enumerate() {
-            if i > 0 {
-                code.push_str(", ");
-            }
+            if i > 0 { code.push_str(", "); }
             code.push_str(&format!("\"{}\"", n));
         }
         code.push_str("]),\n");
@@ -141,6 +141,7 @@ fn main() {
 
     fs::write(&dest, &code).expect("failed to write registry.rs");
 
+    // Re-run whenever a visualizer file is added/removed, or build.rs changes.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/visualizers");
 }

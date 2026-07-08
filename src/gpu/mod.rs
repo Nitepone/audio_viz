@@ -1,0 +1,681 @@
+/// gpu/ — wgpu rendering engine.
+///
+/// Owns the surface, device and the two visualizer render paths:
+///
+///   Software — the visualizer's CPU `Framebuffer` is uploaded to an
+///     sRGB texture and blitted to the swapchain.
+///
+///   Shader — the visualizer's WGSL fragment source is compiled once
+///     (with prelude.wgsl prepended) into a pipeline that renders a
+///     fullscreen triangle into a ping-pong pair of offscreen textures.
+///     The previous frame is bound as an input, enabling phosphor
+///     persistence / feedback effects.  The result is blitted (and, when
+///     the internal resolution is capped, upscaled) to the swapchain.
+///
+/// The visualizer does not necessarily own the whole window: the UI layer
+/// (src/ui.rs) reserves side panels, and the remaining central area is set
+/// each frame via `set_viz_rect()`.  Both render paths blit into that
+/// viewport only; the egui pass then draws the panels on top within the
+/// same frame (see `FrameCtx` / `begin_frame` / `end_frame`).
+///
+/// wgpu selects the native backend per platform: Metal on macOS,
+/// Vulkan/DX12 on Windows, Vulkan/GL on Linux — all backends stay enabled.
+
+use std::sync::Arc;
+
+use anyhow::Context;
+use winit::window::Window;
+
+use crate::visualizer::{Framebuffer, AUDIO_TEX_WIDTH};
+
+const PRELUDE_WGSL: &str = include_str!("prelude.wgsl");
+const BLIT_WGSL: &str = include_str!("blit.wgsl");
+
+/// Offscreen (feedback) texture format. Float precision keeps slow phosphor
+/// decay smooth where 8-bit would posterise.
+const FEEDBACK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Cap the internal render resolution of shader visualizers (in pixels).
+/// Fragment-shader visualizers iterate over hundreds of audio samples per
+/// pixel; capping keeps fullscreen retina windows fluid.  The blit pass
+/// upscales with linear filtering.
+const MAX_INTERNAL_PIXELS: u32 = 1_600_000;
+
+// ── Per-frame uniforms (must match prelude.wgsl) ─────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Uniforms {
+    pub resolution: [f32; 2],
+    pub time: f32,
+    pub dt: f32,
+    pub rms: [f32; 2],
+    pub beat: f32,
+    pub sample_rate: f32,
+    pub params: [[f32; 4]; 4],
+}
+
+/// Audio data uploaded to the GPU each frame: four rows of AUDIO_TEX_WIDTH
+/// floats (left, right, mono, fft).
+pub struct AudioTexData {
+    pub texels: Vec<f32>, // 4 * AUDIO_TEX_WIDTH
+}
+
+impl AudioTexData {
+    pub fn pack(left: &[f32], right: &[f32], mono: &[f32], fft: &[f32]) -> Self {
+        let w = AUDIO_TEX_WIDTH;
+        let mut texels = vec![0.0f32; w * 4];
+        for (row, src) in [left, right, mono, fft].iter().enumerate() {
+            let n = src.len().min(w);
+            texels[row * w..row * w + n].copy_from_slice(&src[..n]);
+        }
+        Self { texels }
+    }
+}
+
+// ── Engine state ─────────────────────────────────────────────────────────────
+
+struct FeedbackTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+/// Ping-pong offscreen targets for the active shader visualizer.
+/// Rebuilt lazily whenever the internal render size changes.
+struct FeedbackState {
+    targets: [FeedbackTarget; 2],
+    /// bind_groups[i] renders INTO targets[i] with targets[1-i] as prev_frame.
+    bind_groups: [wgpu::BindGroup; 2],
+    idx: usize,
+    size: (u32, u32),
+}
+
+struct SoftwareState {
+    texture: wgpu::Texture,
+    blit_bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+/// One in-flight frame: acquired swapchain texture plus the command encoder
+/// shared by the visualizer passes and the UI overlay pass.
+pub struct FrameCtx {
+    frame: wgpu::SurfaceTexture,
+    pub view: wgpu::TextureView,
+    pub encoder: wgpu::CommandEncoder,
+}
+
+pub struct GpuContext {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+
+    sampler: wgpu::Sampler,
+    uniform_buf: wgpu::Buffer,
+    audio_tex: wgpu::Texture,
+    audio_view: wgpu::TextureView,
+
+    shader_bgl: wgpu::BindGroupLayout,
+    blit_bgl: wgpu::BindGroupLayout,
+    blit_pipeline: wgpu::RenderPipeline,
+
+    shader_pipeline: Option<wgpu::RenderPipeline>,
+    feedback: Option<FeedbackState>,
+    software: Option<SoftwareState>,
+
+    /// Area of the surface the visualizer renders into (x, y, w, h in
+    /// physical pixels).  The UI layer updates this every frame.
+    viz_rect: (u32, u32, u32, u32),
+}
+
+impl GpuContext {
+    pub fn new(window: Arc<Window>) -> anyhow::Result<Self> {
+        pollster::block_on(Self::new_async(window))
+    }
+
+    async fn new_async(window: Arc<Window>) -> anyhow::Result<Self> {
+        let size = window.inner_size();
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window)?;
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .context("no compatible GPU adapter found")?;
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("audio-viz device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                },
+                None,
+            )
+            .await?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("linear sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let audio_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("audio data"),
+            size: wgpu::Extent3d {
+                width: AUDIO_TEX_WIDTH as u32,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let audio_view = audio_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Bind group layout for shader visualizers (see prelude.wgsl).
+        let shader_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shader viz bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // Blit pipeline: offscreen / software texture → swapchain.
+        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+        });
+        let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit layout"),
+            bind_group_layouts: &[&blit_bgl],
+            push_constant_ranges: &[],
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit pipeline"),
+            layout: Some(&blit_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_module,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let viz_rect = (0, 0, config.width, config.height);
+
+        Ok(Self {
+            surface,
+            device,
+            queue,
+            config,
+            sampler,
+            uniform_buf,
+            audio_tex,
+            audio_view,
+            shader_bgl,
+            blit_bgl,
+            blit_pipeline,
+            shader_pipeline: None,
+            feedback: None,
+            software: None,
+            viz_rect,
+        })
+    }
+
+    // ── Accessors used by the UI layer ───────────────────────────────────────
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Set the surface area the visualizer renders into (physical pixels).
+    /// Called every frame by the app after the UI has claimed its panels.
+    pub fn set_viz_rect(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        let x = x.min(self.config.width);
+        let y = y.min(self.config.height);
+        let w = w.min(self.config.width - x).max(1);
+        let h = h.min(self.config.height - y).max(1);
+        self.viz_rect = (x, y, w, h);
+    }
+
+    /// Internal render resolution for shader visualizers: the viz rect,
+    /// area-capped preserving aspect.
+    pub fn shader_resolution(&self) -> (u32, u32) {
+        let (_, _, w, h) = self.viz_rect;
+        let area = w as u64 * h as u64;
+        if area <= MAX_INTERNAL_PIXELS as u64 {
+            return (w, h);
+        }
+        let scale = (MAX_INTERNAL_PIXELS as f64 / area as f64).sqrt();
+        (((w as f64 * scale) as u32).max(1), ((h as f64 * scale) as u32).max(1))
+    }
+
+    // ── Shader path setup ────────────────────────────────────────────────────
+
+    /// Compile a shader visualizer's fragment source.  Feedback targets are
+    /// created lazily at render time (they track the viz rect size).
+    pub fn set_shader(&mut self, fragment_wgsl: &str) {
+        let full_src = format!("{PRELUDE_WGSL}\n{fragment_wgsl}");
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shader viz"),
+            source: wgpu::ShaderSource::Wgsl(full_src.into()),
+        });
+
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shader viz layout"),
+            bind_group_layouts: &[&self.shader_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shader viz pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FEEDBACK_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.shader_pipeline = Some(pipeline);
+        self.feedback = None;
+        self.software = None;
+    }
+
+    /// (Re)build feedback targets if their size no longer matches.
+    fn ensure_feedback(&mut self) {
+        let size = self.shader_resolution();
+        if self.feedback.as_ref().map(|f| f.size) == Some(size) {
+            return;
+        }
+
+        let make_target = |label: &str| {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FEEDBACK_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            FeedbackTarget { _texture: texture, view }
+        };
+        let targets = [make_target("feedback 0"), make_target("feedback 1")];
+
+        let make_bind_group = |prev: &FeedbackTarget| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shader viz bind group"),
+                layout: &self.shader_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.audio_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&prev.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            })
+        };
+        // bind_groups[i] renders into targets[i], reading targets[1-i].
+        let bind_groups = [make_bind_group(&targets[1]), make_bind_group(&targets[0])];
+
+        self.feedback = Some(FeedbackState { targets, bind_groups, idx: 0, size });
+    }
+
+    // ── Frame lifecycle ──────────────────────────────────────────────────────
+
+    pub fn begin_frame(&mut self) -> anyhow::Result<FrameCtx> {
+        let frame = self.acquire_frame()?;
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        Ok(FrameCtx { frame, view, encoder })
+    }
+
+    /// Submit the frame.  `pre_cmds` (e.g. egui buffer uploads) are submitted
+    /// before the frame's own encoder.
+    pub fn end_frame(&mut self, fctx: FrameCtx, pre_cmds: Vec<wgpu::CommandBuffer>) {
+        let FrameCtx { frame, view: _view, encoder } = fctx;
+        self.queue.submit(pre_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        frame.present();
+    }
+
+    /// Render one frame of the active shader visualizer into the viz rect.
+    pub fn render_shader(&mut self, fctx: &mut FrameCtx, uniforms: &Uniforms, audio: &AudioTexData) {
+        if self.shader_pipeline.is_none() {
+            return;
+        }
+        self.ensure_feedback();
+
+        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(uniforms));
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.audio_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&audio.texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some((AUDIO_TEX_WIDTH * 4) as u32),
+                rows_per_image: Some(4),
+            },
+            wgpu::Extent3d { width: AUDIO_TEX_WIDTH as u32, height: 4, depth_or_array_layers: 1 },
+        );
+
+        let pipeline = self.shader_pipeline.as_ref().unwrap();
+        let feedback = self.feedback.as_ref().unwrap();
+        let idx = feedback.idx;
+
+        // Pass 1: visualizer → feedback target
+        {
+            let mut pass = fctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("viz pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &feedback.targets[idx].view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &feedback.bind_groups[idx], &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // Pass 2: feedback target → swapchain viz rect (upscales if capped)
+        let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit bind group"),
+            layout: &self.blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&feedback.targets[idx].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.run_blit(&mut fctx.encoder, &blit_bind_group, &fctx.view);
+
+        if let Some(f) = self.feedback.as_mut() {
+            f.idx = 1 - f.idx;
+        }
+    }
+
+    /// Render one frame of a software visualizer from its CPU framebuffer.
+    pub fn render_software(&mut self, fctx: &mut FrameCtx, fb: &Framebuffer) {
+        if fb.width == 0 || fb.height == 0 {
+            return;
+        }
+
+        // (Re)create the upload texture when the framebuffer size changes.
+        let needs_new = self
+            .software
+            .as_ref()
+            .map(|s| s.size != (fb.width, fb.height))
+            .unwrap_or(true);
+        if needs_new {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("software framebuffer"),
+                size: wgpu::Extent3d {
+                    width: fb.width,
+                    height: fb.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("software blit bind group"),
+                layout: &self.blit_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.software =
+                Some(SoftwareState { texture, blit_bind_group, size: (fb.width, fb.height) });
+            self.shader_pipeline = None;
+            self.feedback = None;
+        }
+
+        let sw = self.software.as_ref().unwrap();
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &sw.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &fb.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(fb.width * 4),
+                rows_per_image: Some(fb.height),
+            },
+            wgpu::Extent3d { width: fb.width, height: fb.height, depth_or_array_layers: 1 },
+        );
+
+        let sw = self.software.as_ref().unwrap();
+        self.run_blit(&mut fctx.encoder, &sw.blit_bind_group, &fctx.view);
+    }
+
+    /// Blit `bind_group`'s texture into the viz rect of `target`, clearing
+    /// the rest of the target to black.
+    fn run_blit(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        target: &wgpu::TextureView,
+    ) {
+        let (x, y, w, h) = self.viz_rect;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.blit_pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn acquire_frame(&mut self) -> anyhow::Result<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            Ok(f) => Ok(f),
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                Ok(self.surface.get_current_texture()?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
