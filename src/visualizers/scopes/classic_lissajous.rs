@@ -14,23 +14,41 @@
 ///   persistence — fraction of phosphor brightness retained per second
 ///   theme       — phosphor color: green (P31) / amber (P3) / white (P4)
 ///   focus       — beam width (lower = sharper trace)
+///   window      — length of the traced window in milliseconds
+///   orientation — left-right (mono on the diagonal) / mid-side (mono vertical)
 
 use crate::config::merge_config;
-use crate::visualizer::{AudioFrame, PixelSize, RenderMode, Visualizer};
+use crate::visualizer::{AudioFrame, PixelSize, RenderMode, Visualizer, FFT_SIZE, SAMPLE_RATE};
 
 const CONFIG_VERSION: u64 = 1;
 const FRAGMENT_WGSL: &str = include_str!("classic_lissajous.wgsl");
+/// Control points along the path — must match N_POINTS in the shader so the
+/// CPU-computed bounding box matches the drawn geometry.
+const N_POINTS: usize = 512;
 
 pub struct ClassicLissajousViz {
     gain: f32,
     persistence: f32,
     theme: String,
     focus: f32,
+    window_ms: f32,
+    orientation: String,
+    /// Trace bounding box [min_x, min_y, max_x, max_y] in square coords,
+    /// recomputed each tick for the shader's early-out.
+    bbox: [f32; 4],
 }
 
 impl ClassicLissajousViz {
     pub fn new() -> Self {
-        Self { gain: 1.0, persistence: 0.5, theme: "green".to_string(), focus: 1.0 }
+        Self {
+            gain: 1.0,
+            persistence: 0.5,
+            theme: "green".to_string(),
+            focus: 1.0,
+            window_ms: 23.0,
+            orientation: "left-right".to_string(),
+            bbox: [-1.2, -1.2, 1.2, 1.2],
+        }
     }
 
     fn theme_index(&self) -> f32 {
@@ -39,6 +57,14 @@ impl ClassicLissajousViz {
             "white" => 2.0,
             _ => 0.0, // green
         }
+    }
+
+    fn n_samples(&self) -> usize {
+        ((self.window_ms / 1000.0 * SAMPLE_RATE as f32) as usize).clamp(64, FFT_SIZE)
+    }
+
+    fn is_mid_side(&self) -> bool {
+        self.orientation == "mid-side"
     }
 }
 
@@ -53,9 +79,32 @@ impl Visualizer for ClassicLissajousViz {
         RenderMode::Shader { fragment_wgsl: FRAGMENT_WGSL }
     }
 
-    fn tick(&mut self, _audio: &AudioFrame, _dt: f32, _size: PixelSize) {
-        // All per-frame state lives on the GPU (feedback texture); the audio
-        // window itself is uploaded by the engine.
+    fn tick(&mut self, audio: &AudioFrame, _dt: f32, _size: PixelSize) {
+        // Recompute the trace bounding box (square coords) so the shader can
+        // skip pixels the beam never reaches.  Mirrors path_pt() in the WGSL.
+        let n = self.n_samples();
+        let base = FFT_SIZE - n;
+        let stride = n as f32 / N_POINTS as f32;
+        let mid_side = self.is_mid_side();
+        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+        for i in 0..N_POINTS {
+            let j = (base + (i as f32 * stride) as usize).min(FFT_SIZE - 1);
+            let l = audio.left[j] * self.gain;
+            let r = audio.right[j] * self.gain;
+            let (x, y) = if mid_side {
+                ((l - r) * 0.707_106_78, -(l + r) * 0.707_106_78)
+            } else {
+                (l, -r)
+            };
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        if min_x <= max_x {
+            self.bbox = [min_x, min_y, max_x, max_y];
+        }
     }
 
     fn shader_params(&self) -> [f32; 16] {
@@ -64,6 +113,12 @@ impl Visualizer for ClassicLissajousViz {
         p[1] = self.persistence;
         p[2] = self.theme_index();
         p[3] = self.focus;
+        p[4] = self.n_samples() as f32;
+        p[5] = if self.is_mid_side() { 1.0 } else { 0.0 };
+        p[6] = self.bbox[0];
+        p[7] = self.bbox[1];
+        p[8] = self.bbox[2];
+        p[9] = self.bbox[3];
         p
     }
 
@@ -102,6 +157,21 @@ impl Visualizer for ClassicLissajousViz {
                     "value": 1.0,
                     "min": 0.3,
                     "max": 3.0
+                },
+                {
+                    "name": "window",
+                    "display_name": "Window (ms)",
+                    "type": "float",
+                    "value": 23.0,
+                    "min": 5.0,
+                    "max": 50.0
+                },
+                {
+                    "name": "orientation",
+                    "display_name": "Orientation",
+                    "type": "enum",
+                    "value": "left-right",
+                    "variants": ["left-right", "mid-side"]
                 }
             ]
         })
@@ -123,6 +193,13 @@ impl Visualizer for ClassicLissajousViz {
                         self.theme = entry["value"].as_str().unwrap_or("green").to_string()
                     }
                     "focus" => self.focus = entry["value"].as_f64().unwrap_or(1.0) as f32,
+                    "window" => {
+                        self.window_ms = entry["value"].as_f64().unwrap_or(23.0) as f32
+                    }
+                    "orientation" => {
+                        self.orientation =
+                            entry["value"].as_str().unwrap_or("left-right").to_string()
+                    }
                     _ => {}
                 }
             }

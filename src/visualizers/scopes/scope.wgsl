@@ -5,6 +5,10 @@
 //   .y  n_samples  — number of trailing samples shown across the width
 //   .z  mode       — 0 = stereo (two panels), 1 = mono (single averaged trace)
 //   .w  thickness  — line core width in pixels
+//   u.params[1].x  trig_base — sample index mapped to the left edge (x=0).
+//                   The CPU sets this to a rising zero-crossing so periodic
+//                   signals hold still; without trigger it is the plain
+//                   trailing-window start.
 //
 // Each pixel estimates its distance to the waveform polyline by sampling the
 // waveform at several x offsets around itself, then shades a Gaussian core
@@ -16,11 +20,24 @@ const TAPS: i32 = 12;
 const TRAIL: f32 = 0.01;
 
 // y position (in pixels) of the waveform for channel `row` at pixel column x.
+// The fractional sample index is interpolated with a Catmull-Rom spline so
+// the trace stays smooth when few samples span the width — truncating to the
+// nearest sample would draw stair-steps.
 fn wave_y_px(row: i32, x_px: f32, n_show: f32, gain: f32,
              panel_top: f32, panel_h: f32) -> f32 {
-    let base = f32(AUDIO_SAMPLES) - n_show;
-    let idx = i32(base + clamp(x_px / u.resolution.x, 0.0, 1.0) * (n_show - 1.0));
-    let amp = clamp(audio_sample(row, idx) * gain, -1.0, 1.0);
+    let base = u.params[1].x;
+    let fidx = base + clamp(x_px / u.resolution.x, 0.0, 1.0) * (n_show - 1.0);
+    let i1 = i32(floor(fidx));
+    let t  = fract(fidx);
+    let s0 = audio_sample(row, i1 - 1);
+    let s1 = audio_sample(row, i1);
+    let s2 = audio_sample(row, i1 + 1);
+    let s3 = audio_sample(row, i1 + 2);
+    let a = 0.5 * (2.0 * s1
+        + (s2 - s0) * t
+        + (2.0 * s0 - 5.0 * s1 + 4.0 * s2 - s3) * t * t
+        + (3.0 * (s1 - s2) + s3 - s0) * t * t * t);
+    let amp = clamp(a * gain, -1.0, 1.0);
     return panel_top + (1.0 - amp) * 0.5 * panel_h;
 }
 

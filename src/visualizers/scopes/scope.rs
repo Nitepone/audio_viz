@@ -13,6 +13,8 @@
 ///   duration  — seconds of audio shown across the width
 ///   mode      — stereo / mono
 ///   thickness — line width in pixels
+///   trigger   — off / rising: align the left edge to a rising zero-crossing
+///               so periodic signals hold still, like a real scope
 
 use crate::config::merge_config;
 use crate::visualizer::{AudioFrame, PixelSize, RenderMode, Visualizer, FFT_SIZE, SAMPLE_RATE};
@@ -28,11 +30,25 @@ pub struct ScopeViz {
     duration: f32,
     mono: bool,
     thickness: f32,
+    trigger: bool,
+    /// Sample index mapped to the left edge, recomputed each tick.
+    trig_base: f32,
 }
 
 impl ScopeViz {
     pub fn new() -> Self {
-        Self { gain: 1.0, duration: DURATION_DEFAULT, mono: false, thickness: 1.5 }
+        Self {
+            gain: 1.0,
+            duration: DURATION_DEFAULT,
+            mono: false,
+            thickness: 1.5,
+            trigger: true,
+            trig_base: 0.0,
+        }
+    }
+
+    fn n_samples(&self) -> usize {
+        ((self.duration * SAMPLE_RATE as f32) as usize).clamp(2, FFT_SIZE)
     }
 }
 
@@ -47,16 +63,23 @@ impl Visualizer for ScopeViz {
         RenderMode::Shader { fragment_wgsl: FRAGMENT_WGSL }
     }
 
-    fn tick(&mut self, _audio: &AudioFrame, _dt: f32, _size: PixelSize) {}
+    fn tick(&mut self, audio: &AudioFrame, _dt: f32, _size: PixelSize) {
+        let n_show = self.n_samples();
+        let default_base = (FFT_SIZE - n_show) as f32;
+        self.trig_base = if self.trigger {
+            trigger_base(&audio.mono, n_show).unwrap_or(default_base)
+        } else {
+            default_base
+        };
+    }
 
     fn shader_params(&self) -> [f32; 16] {
-        let n_samples =
-            ((self.duration * SAMPLE_RATE as f32) as usize).clamp(2, FFT_SIZE) as f32;
         let mut p = [0.0f32; 16];
         p[0] = self.gain;
-        p[1] = n_samples;
+        p[1] = self.n_samples() as f32;
         p[2] = if self.mono { 1.0 } else { 0.0 };
         p[3] = self.thickness;
+        p[4] = self.trig_base;
         p
     }
 
@@ -95,6 +118,13 @@ impl Visualizer for ScopeViz {
                     "value": 1.5,
                     "min": 0.5,
                     "max": 6.0
+                },
+                {
+                    "name": "trigger",
+                    "display_name": "Trigger",
+                    "type": "enum",
+                    "value": "rising",
+                    "variants": ["off", "rising"]
                 }
             ]
         })
@@ -117,12 +147,43 @@ impl Visualizer for ScopeViz {
                     "thickness" => {
                         self.thickness = entry["value"].as_f64().unwrap_or(1.5) as f32
                     }
+                    "trigger" => self.trigger = entry["value"].as_str() != Some("off"),
                     _ => {}
                 }
             }
         }
         Ok(merged)
     }
+}
+
+/// Find the sample index to map to the left edge so a periodic signal holds
+/// still: the latest rising zero-crossing at or before the plain trailing
+/// window start.  Returns `None` when the signal is too quiet to trigger
+/// reliably (caller falls back to the untriggered window).
+fn trigger_base(mono: &[f32], n_show: usize) -> Option<f32> {
+    let base0 = FFT_SIZE.saturating_sub(n_show);
+    if base0 < 2 {
+        return None;
+    }
+    // Don't chase noise: require a bit of level in the visible region.
+    let peak = mono[base0.saturating_sub(n_show)..]
+        .iter()
+        .fold(0.0f32, |m, &v| m.max(v.abs()));
+    if peak < 0.02 {
+        return None;
+    }
+    // Hysteresis threshold scaled to signal level: cross from below -eps to
+    // at/above 0 counts as a rising edge.
+    let eps = (peak * 0.1).min(0.05);
+    // Look back at most one window for the most recent rising crossing.
+    let search = n_show.min(base0);
+    for k in 1..search {
+        let i = base0 - k;
+        if mono[i] >= 0.0 && mono[i - 1] < -eps {
+            return Some(i as f32);
+        }
+    }
+    None
 }
 
 pub fn register() -> Vec<Box<dyn Visualizer>> {

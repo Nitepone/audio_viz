@@ -97,6 +97,35 @@ impl Framebuffer {
         }
     }
 
+    /// Clear the whole buffer to opaque black in one memset.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.data.fill(0);
+    }
+
+    /// Fill an axis-aligned rectangle with a solid colour.  Writes each row as
+    /// one contiguous span (no per-pixel bounds checks), so this is much
+    /// cheaper than calling `put()` in a loop for large fills.
+    pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgb: [u8; 3]) {
+        let x0 = x.min(self.width);
+        let y0 = y.min(self.height);
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let px = [rgb[0], rgb[1], rgb[2], 255];
+        let stride = (self.width * 4) as usize;
+        for row in y0..y1 {
+            let base = row as usize * stride;
+            let start = base + x0 as usize * 4;
+            let end = base + x1 as usize * 4;
+            for cell in self.data[start..end].chunks_exact_mut(4) {
+                cell.copy_from_slice(&px);
+            }
+        }
+    }
+
     /// Move all pixel rows down by `n` rows (newest content goes on top).
     /// Rows scrolled off the bottom are discarded; the top `n` rows are
     /// left with their previous content and should be overwritten.

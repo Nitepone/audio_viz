@@ -447,9 +447,11 @@ impl GpuContext {
         self.viz_rect = (x, y, w, h);
     }
 
-    /// Internal render resolution for shader visualizers: the viz rect,
-    /// area-capped preserving aspect.
-    pub fn shader_resolution(&self) -> (u32, u32) {
+    /// Internal render resolution for visualizers: the viz rect, area-capped
+    /// preserving aspect.  Applies to both the shader path (feedback targets)
+    /// and the software path (CPU framebuffer) — the present blit upscales the
+    /// capped source to fill the viz rect, so full-retina panes stay fluid.
+    pub fn render_resolution(&self) -> (u32, u32) {
         let (_, _, w, h) = self.viz_rect;
         let area = w as u64 * h as u64;
         if area <= MAX_INTERNAL_PIXELS as u64 {
@@ -509,7 +511,7 @@ impl GpuContext {
 
     /// (Re)build feedback targets if their size no longer matches.
     fn ensure_feedback(&mut self) {
-        let size = self.shader_resolution();
+        let size = self.render_resolution();
         if self.feedback.as_ref().map(|f| f.size) == Some(size) {
             return;
         }

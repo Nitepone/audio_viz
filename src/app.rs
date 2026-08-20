@@ -175,13 +175,12 @@ impl App {
         gpu.set_viz_rect(rx, ry, rw, rh);
         gpu.set_post_chain(&self.viz.chain(), (t0 - self.start).as_secs_f32());
 
-        let size = match self.viz.mode() {
-            RenderMode::Shader { .. } => {
-                let (w, h) = gpu.shader_resolution();
-                PixelSize { width: w, height: h }
-            }
-            RenderMode::Software => PixelSize { width: rw.max(1), height: rh.max(1) },
-        };
+        // Both paths render at the area-capped resolution and are upscaled by
+        // the present blit — this keeps CPU (software) and GPU (shader) cost
+        // bounded on high-DPI panes instead of scaling with the full retina
+        // pixel count.
+        let (rw_cap, rh_cap) = gpu.render_resolution();
+        let size = PixelSize { width: rw_cap.max(1), height: rh_cap.max(1) };
 
         self.viz.tick(&audio, dt, size);
 
